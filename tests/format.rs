@@ -124,11 +124,12 @@ fn metadata_item_count_mismatch_should_be_detected_during_traversal() -> Result<
     write_page(&file, 1, &meta)?;
     drop(file);
     let database = Database::open(path)?;
+    let mut scan = database
+        .read()?
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)?;
     assert!(matches!(
-        database
-            .read()?
-            .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-        Err(Error::Corrupt(_))
+        scan.find_map(std::result::Result::err),
+        Some(Error::Corrupt(_))
     ));
     Ok(())
 }
@@ -155,11 +156,12 @@ fn duplicate_internal_child_should_return_corrupt_during_scan() -> Result<()> {
     write_page(&file, root, &page)?;
     drop(file);
     let database = Database::open(path)?;
+    let mut scan = database
+        .read()?
+        .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)?;
     assert!(matches!(
-        database
-            .read()?
-            .scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-        Err(Error::Corrupt(_))
+        scan.find_map(std::result::Result::err),
+        Some(Error::Corrupt(_))
     ));
     Ok(())
 }

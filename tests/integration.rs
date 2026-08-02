@@ -67,9 +67,128 @@ fn scan_should_honor_all_bound_kinds() -> Result<()> {
     let keys = database
         .read()?
         .scan(Bound::Included(b"b"), Bound::Excluded(b"d"))?
-        .map(|(key, _)| key)
-        .collect::<Vec<_>>();
-    assert_eq!(keys, vec![Box::from(&b"b"[..]), Box::from(&b"c"[..])]);
+        .map(|entry| entry.map(|entry| entry.key().to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
+    Ok(())
+}
+
+#[test]
+fn reverse_scan_and_seek_should_honor_original_bounds() -> Result<()> {
+    let directory = tempdir()?;
+    let database = Database::open(directory.path().join("reverse-scan.actdb"))?;
+    let mut write = database.write()?;
+    for key in [b"a", b"b", b"c", b"d", b"e"] {
+        write.put(key, key)?;
+    }
+    write.commit()?;
+
+    let read = database.read()?;
+    let mut scan = read.scan_reverse(Bound::Included(b"b"), Bound::Excluded(b"e"))?;
+    assert_eq!(scan.next().transpose()?.unwrap().key(), b"d");
+    scan.seek(Bound::Excluded(b"c"))?;
+    assert_eq!(scan.next().transpose()?.unwrap().key(), b"b");
+    scan.seek(Bound::Included(b"z"))?;
+    assert_eq!(scan.next().transpose()?.unwrap().key(), b"d");
+    scan.seek(Bound::Excluded(b"b"))?;
+    assert!(scan.next().is_none());
+    Ok(())
+}
+
+#[test]
+fn prefix_scans_should_handle_empty_and_ff_prefixes() -> Result<()> {
+    let directory = tempdir()?;
+    let database = Database::open(directory.path().join("prefix-scan.actdb"))?;
+    let keys: [&[u8]; 6] = [b"", b"a", b"aa", b"ab", b"\xff", b"\xff\xff"];
+    let mut write = database.write()?;
+    for key in keys {
+        write.put(key, key)?;
+    }
+    write.commit()?;
+    let read = database.read()?;
+
+    let forward = read
+        .scan_prefix(b"a")?
+        .map(|entry| entry.map(|entry| entry.key().to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(forward, vec![b"a".to_vec(), b"aa".to_vec(), b"ab".to_vec()]);
+
+    let reverse = read
+        .scan_prefix_reverse(b"\xff")?
+        .map(|entry| entry.map(|entry| entry.key().to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(reverse, vec![b"\xff\xff".to_vec(), b"\xff".to_vec()]);
+    assert_eq!(read.scan_prefix(b"")?.count(), keys.len());
+    Ok(())
+}
+
+#[test]
+fn scan_should_defer_overflow_reads_until_value_is_requested() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("lazy-overflow.actdb");
+    {
+        let database = Database::open(&path)?;
+        let mut write = database.write()?;
+        write.put(b"large", &vec![7; PAGE_SIZE * 3])?;
+        write.commit()?;
+    }
+    let database = Database::open(path)?;
+    let read = database.read()?;
+    let mut scan = read.scan_prefix(b"large")?;
+    let loads_after_seek = database.stats()?.cache_loads;
+    let entry = scan.next().transpose()?.unwrap();
+    assert_eq!(database.stats()?.cache_loads, loads_after_seek);
+    assert_eq!(entry.value()?.len(), PAGE_SIZE * 3);
+    assert!(database.stats()?.cache_loads > loads_after_seek);
+    Ok(())
+}
+
+#[test]
+fn first_scan_item_should_read_only_the_search_path() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("lazy-first-item.actdb");
+    {
+        let database = Database::open(&path)?;
+        let mut write = database.write()?;
+        for number in 0_u32..5_000 {
+            write.put(&number.to_be_bytes(), b"value")?;
+        }
+        write.commit()?;
+    }
+
+    let database = Database::open(path)?;
+    let before = database.stats()?.cache_loads;
+    let read = database.read()?;
+    let mut scan = read.scan(Bound::Unbounded, Bound::Unbounded)?;
+    let after_seek = database.stats()?.cache_loads;
+    assert!(after_seek > before);
+    assert!(after_seek - before < 64);
+    assert_eq!(scan.next().transpose()?.unwrap().key(), 0_u32.to_be_bytes());
+    assert_eq!(database.stats()?.cache_loads, after_seek);
+    Ok(())
+}
+
+#[test]
+fn detached_scan_entry_should_keep_its_snapshot_registered() -> Result<()> {
+    let directory = tempdir()?;
+    let database = Database::open(directory.path().join("scan-lease.actdb"))?;
+    let mut write = database.write()?;
+    write.put(b"key", b"old")?;
+    write.commit()?;
+
+    let read = database.read()?;
+    let mut scan = read.scan(Bound::Unbounded, Bound::Unbounded)?;
+    let entry = scan.next().transpose()?.unwrap();
+    drop(scan);
+    drop(read);
+    assert_eq!(database.stats()?.pinned_snapshots, 1);
+
+    let mut update = database.write()?;
+    update.put(b"key", b"new")?;
+    update.commit()?;
+    assert_eq!(entry.value()?.as_ref(), b"old");
+    drop(entry);
+    assert_eq!(database.stats()?.pinned_snapshots, 0);
     Ok(())
 }
 

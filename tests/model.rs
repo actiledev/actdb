@@ -38,8 +38,11 @@ fn mixed_transactions_should_match_reference_map_after_reopen() -> Result<()> {
     let actual = database
         .read()?
         .scan(Bound::Unbounded, Bound::Unbounded)?
-        .map(|(key, value)| (key.into_vec(), value.into_vec()))
-        .collect::<BTreeMap<_, _>>();
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.key().to_vec(), entry.value()?.to_vec()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     assert_eq!(actual, expected);
     Ok(())
 }
@@ -82,8 +85,11 @@ fn variable_sized_multilevel_transactions_should_match_reference_map() -> Result
     let actual = database
         .read()?
         .scan(Bound::Unbounded, Bound::Unbounded)?
-        .map(|(key, value)| (key.into_vec(), value.into_vec()))
-        .collect::<BTreeMap<_, _>>();
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.key().to_vec(), entry.value()?.to_vec()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     assert_eq!(actual, expected);
     Ok(())
 }
