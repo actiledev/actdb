@@ -21,12 +21,15 @@ fn initialized_file_should_match_the_documented_metadata_layout() -> Result<()> 
     assert_eq!(&meta[0..8], b"ACTDB\0\r\n");
     assert_eq!(get_u16(&meta, 8), 1);
     assert_eq!(get_u16(&meta, 10), PAGE_SIZE as u16);
+    assert_eq!(get_u32(&meta, 12), 2);
     assert_eq!(get_u64(&meta, 16), 1);
     assert_eq!(get_u64(&meta, 24), 2);
-    assert_eq!(get_u64(&meta, 32), 3);
+    assert_eq!(get_u64(&meta, 32), 4);
     assert_eq!(get_u64(&meta, 40), 0);
-    assert!(meta[12..16].iter().all(|byte| *byte == 0));
-    assert!(meta[48..CHECKSUM_OFFSET].iter().all(|byte| *byte == 0));
+    assert_eq!(get_u64(&meta, 48), 3);
+    assert_eq!(get_u64(&meta, 64), 1);
+    assert_eq!(get_u64(&meta, 72), 1);
+    assert!(meta[96..CHECKSUM_OFFSET].iter().all(|byte| *byte == 0));
     assert_eq!(
         get_u32(&meta, CHECKSUM_OFFSET),
         crc32fast::hash(&meta[..CHECKSUM_OFFSET])
@@ -43,7 +46,7 @@ fn nonzero_metadata_reserved_bytes_should_invalidate_both_slots() -> Result<()> 
     let file = open_rw(&path)?;
     for slot in 0..2 {
         let mut page = read_page(&file, slot)?;
-        page[12] = 1;
+        page[96] = 1;
         finish_page(&mut page);
         write_page(&file, slot, &page)?;
     }
@@ -177,6 +180,42 @@ fn recognizable_unsupported_version_should_return_unsupported_version() -> Resul
         Database::open(path),
         Err(Error::UnsupportedVersion(2))
     ));
+    Ok(())
+}
+
+#[test]
+fn obsolete_prerelease_layout_should_be_rejected() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("obsolete-layout.actdb");
+    let database = Database::open(&path)?;
+    drop(database);
+    let file = open_rw(&path)?;
+    for slot in 0..2 {
+        let mut meta = read_page(&file, slot)?;
+        put_u32(&mut meta, 12, 0);
+        finish_page(&mut meta);
+        write_page(&file, slot, &meta)?;
+    }
+    drop(file);
+    assert!(matches!(Database::open(path), Err(Error::InvalidFormat(_))));
+    Ok(())
+}
+
+#[test]
+fn corrupt_free_tree_should_be_rejected_during_open() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("free-tree-corrupt.actdb");
+    let database = Database::open(&path)?;
+    drop(database);
+    let file = open_rw(&path)?;
+    let meta = read_page(&file, 0)?;
+    let free_root = get_u64(&meta, 48);
+    let mut page = read_page(&file, free_root)?;
+    page[4] = 1;
+    finish_page(&mut page);
+    write_page(&file, free_root, &page)?;
+    drop(file);
+    assert!(matches!(Database::open(path), Err(Error::Corrupt(_))));
     Ok(())
 }
 

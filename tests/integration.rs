@@ -108,7 +108,7 @@ fn single_inline_update_should_append_only_the_tree_path() -> Result<()> {
     update.put(&0_u32.to_be_bytes(), b"replacement")?;
     update.commit()?;
     let appended_pages = (std::fs::metadata(path)?.len() - length_before) / PAGE_SIZE as u64;
-    assert_eq!(appended_pages, path_pages);
+    assert_eq!(appended_pages, path_pages + 1);
     Ok(())
 }
 
@@ -134,7 +134,7 @@ fn repeated_updates_to_one_leaf_should_write_the_path_once() -> Result<()> {
     }
     update.commit()?;
     let appended_pages = (std::fs::metadata(path)?.len() - length_before) / PAGE_SIZE as u64;
-    assert_eq!(appended_pages, path_pages);
+    assert_eq!(appended_pages, path_pages + 1);
     Ok(())
 }
 
@@ -178,7 +178,7 @@ fn overflow_update_should_append_only_path_and_new_chain() -> Result<()> {
     update.commit()?;
     let appended_pages = (std::fs::metadata(path)?.len() - length_before) / PAGE_SIZE as u64;
     let overflow_pages = replacement.len().div_ceil(OVERFLOW_PAYLOAD) as u64;
-    assert_eq!(appended_pages, path_pages + overflow_pages);
+    assert_eq!(appended_pages, path_pages + overflow_pages + 1);
     Ok(())
 }
 

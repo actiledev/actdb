@@ -3,6 +3,7 @@ use crate::{Error, Result};
 pub(crate) const PAGE_SIZE: usize = 4096;
 pub(crate) const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 pub(crate) const FORMAT_VERSION: u16 = 1;
+pub(crate) const LAYOUT_REVISION: u32 = 2;
 pub(crate) const META_PAGES: u64 = 2;
 pub(crate) const MAX_KEY_SIZE: usize = 1024;
 pub(crate) const MAX_VALUE_SIZE: usize = u32::MAX as usize;
@@ -14,13 +15,21 @@ pub(crate) const PAGE_CHECKSUM_OFFSET: usize = PAGE_SIZE - 4;
 pub(crate) const LEAF: u8 = 1;
 pub(crate) const INTERNAL: u8 = 2;
 pub(crate) const OVERFLOW: u8 = 3;
+pub(crate) const FREE_LEAF: u8 = 4;
+pub(crate) const FREE_INTERNAL: u8 = 5;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Meta {
     pub generation: u64,
     pub root: u64,
     pub page_count: u64,
     pub item_count: u64,
+    pub free_root: u64,
+    pub logical_bytes: u64,
+    pub user_tree_pages: u64,
+    pub free_tree_pages: u64,
+    pub free_pages: u64,
+    pub fallback_pages: u64,
 }
 
 pub(crate) fn encode_meta(meta: Meta) -> [u8; PAGE_SIZE] {
@@ -28,10 +37,17 @@ pub(crate) fn encode_meta(meta: Meta) -> [u8; PAGE_SIZE] {
     page[..8].copy_from_slice(&MAGIC);
     put_u16(&mut page, 8, FORMAT_VERSION);
     put_u16(&mut page, 10, PAGE_SIZE as u16);
+    put_u32(&mut page, 12, LAYOUT_REVISION);
     put_u64(&mut page, 16, meta.generation);
     put_u64(&mut page, 24, meta.root);
     put_u64(&mut page, 32, meta.page_count);
     put_u64(&mut page, 40, meta.item_count);
+    put_u64(&mut page, 48, meta.free_root);
+    put_u64(&mut page, 56, meta.logical_bytes);
+    put_u64(&mut page, 64, meta.user_tree_pages);
+    put_u64(&mut page, 72, meta.free_tree_pages);
+    put_u64(&mut page, 80, meta.free_pages);
+    put_u64(&mut page, 88, meta.fallback_pages);
     let checksum = checksum(&page[..PAGE_SIZE - 4]);
     put_u32(&mut page, PAGE_SIZE - 4, checksum);
     page
@@ -48,9 +64,10 @@ pub(crate) fn decode_meta(page: &[u8; PAGE_SIZE]) -> Result<Meta> {
     if usize::from(get_u16(page, 10)?) != PAGE_SIZE {
         return Err(Error::InvalidFormat("unsupported page size"));
     }
-    if page[12..16].iter().any(|byte| *byte != 0)
-        || page[48..PAGE_CHECKSUM_OFFSET].iter().any(|byte| *byte != 0)
-    {
+    if get_u32(page, 12)? != LAYOUT_REVISION {
+        return Err(Error::InvalidFormat("obsolete prerelease metadata layout"));
+    }
+    if page[96..PAGE_CHECKSUM_OFFSET].iter().any(|byte| *byte != 0) {
         return Err(Error::Corrupt("metadata reserved bytes are nonzero".into()));
     }
     let expected = get_u32(page, PAGE_CHECKSUM_OFFSET)?;
@@ -62,9 +79,25 @@ pub(crate) fn decode_meta(page: &[u8; PAGE_SIZE]) -> Result<Meta> {
         root: get_u64(page, 24)?,
         page_count: get_u64(page, 32)?,
         item_count: get_u64(page, 40)?,
+        free_root: get_u64(page, 48)?,
+        logical_bytes: get_u64(page, 56)?,
+        user_tree_pages: get_u64(page, 64)?,
+        free_tree_pages: get_u64(page, 72)?,
+        free_pages: get_u64(page, 80)?,
+        fallback_pages: get_u64(page, 88)?,
     };
     if meta.root < META_PAGES || meta.root >= meta.page_count {
         return Err(Error::Corrupt("metadata root is outside the file".into()));
+    }
+    if meta.free_root < META_PAGES || meta.free_root >= meta.page_count {
+        return Err(Error::Corrupt(
+            "metadata free-tree root is outside the file".into(),
+        ));
+    }
+    if meta.user_tree_pages == 0 || meta.free_tree_pages == 0 {
+        return Err(Error::Corrupt(
+            "metadata contains an empty page graph".into(),
+        ));
     }
     Ok(meta)
 }

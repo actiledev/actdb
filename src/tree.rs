@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -8,6 +7,7 @@ use crate::format::{
     self, INTERNAL, LEAF, OVERFLOW, PAGE_CHECKSUM_OFFSET, PAGE_HEADER, PAGE_SIZE, SLOT_SIZE,
 };
 use crate::io;
+use crate::io::PageIo;
 use crate::{Error, Result};
 
 const PAGE_END: usize = PAGE_CHECKSUM_OFFSET;
@@ -67,8 +67,8 @@ enum MutableNode {
     Internal(Vec<Child>),
 }
 
-pub(crate) struct MutableTree<'a> {
-    file: &'a File,
+pub(crate) struct MutableTree<'a, I: PageIo + ?Sized> {
+    file: &'a I,
     cache: &'a Cache,
     page_count: u64,
     root: PageRef,
@@ -81,10 +81,28 @@ pub(crate) struct FinishedTree {
     pub root: u64,
     pub page_count: u64,
     pub pages: Vec<(u64, [u8; PAGE_SIZE])>,
+    pub retired: HashSet<u64>,
 }
 
 pub(crate) struct PutOutcome {
     pub inserted: bool,
+}
+
+pub(crate) struct AllocationPlan {
+    pub tree_pages: usize,
+    pub overflow_chains: Vec<usize>,
+}
+
+impl AllocationPlan {
+    pub fn total_pages(&self) -> Result<usize> {
+        self.overflow_chains
+            .iter()
+            .try_fold(self.tree_pages, |total, pages| {
+                total
+                    .checked_add(*pages)
+                    .ok_or_else(|| Error::Corrupt("transaction page count overflow".into()))
+            })
+    }
 }
 
 struct Mutation {
@@ -92,8 +110,8 @@ struct Mutation {
     split: Option<(Vec<u8>, PageRef)>,
 }
 
-impl<'a> MutableTree<'a> {
-    pub fn new(file: &'a File, cache: &'a Cache, root: u64, page_count: u64) -> Self {
+impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
+    pub fn new(file: &'a I, cache: &'a Cache, root: u64, page_count: u64) -> Self {
         Self {
             file,
             cache,
@@ -216,16 +234,49 @@ impl<'a> MutableTree<'a> {
         Ok(true)
     }
 
-    pub fn finish(self, first_page: u64) -> Result<FinishedTree> {
+    pub fn required_pages(&self) -> Result<usize> {
+        self.allocation_plan()?.total_pages()
+    }
+
+    pub fn allocation_plan(&self) -> Result<AllocationPlan> {
         let mut reachable = HashSet::new();
         self.collect_reachable(self.root, &mut reachable, 0)?;
+        let mut dirty_ids = reachable.into_iter().collect::<Vec<_>>();
+        dirty_ids.sort_unstable();
+        let mut overflow_chains = Vec::new();
+        for dirty_id in &dirty_ids {
+            let MutableNode::Leaf(entries) = self.dirty_node(*dirty_id)? else {
+                continue;
+            };
+            for entry in entries {
+                if let StoredValue::Pending(value) = &entry.value {
+                    overflow_chains.push(value.len().div_ceil(PAGE_END - OVERFLOW_HEADER));
+                }
+            }
+        }
+        Ok(AllocationPlan {
+            tree_pages: dirty_ids.len(),
+            overflow_chains,
+        })
+    }
+
+    pub fn finish(self, assigned_pages: &[u64], base_page_count: u64) -> Result<FinishedTree> {
+        let mut reachable = HashSet::new();
+        self.collect_reachable(self.root, &mut reachable, 0)?;
+        if assigned_pages.len() != self.required_pages()? {
+            return Err(Error::Corrupt("user-tree allocation count mismatch".into()));
+        }
+        let mut assigned = assigned_pages.iter().copied();
         let mut physical = vec![None; self.dirty.len()];
-        let mut next_page = first_page;
+        let mut page_count = base_page_count;
         let mut dirty_ids = reachable.into_iter().collect::<Vec<_>>();
         dirty_ids.sort_unstable();
         for &dirty_id in &dirty_ids {
-            physical[dirty_id] = Some(next_page);
-            next_page = checked_next_page(next_page)?;
+            let page_id = assigned
+                .next()
+                .ok_or_else(|| Error::Corrupt("missing assigned user-tree page".into()))?;
+            physical[dirty_id] = Some(page_id);
+            page_count = page_count.max(checked_next_page(page_id)?);
         }
 
         let mut overflow_heads = HashMap::new();
@@ -238,15 +289,28 @@ impl<'a> MutableTree<'a> {
                 let StoredValue::Pending(value) = &entry.value else {
                     continue;
                 };
-                let head = next_page;
+                let head = assigned
+                    .next()
+                    .ok_or_else(|| Error::Corrupt("missing assigned overflow page".into()))?;
                 let chunks = value.chunks(PAGE_END - OVERFLOW_HEADER).collect::<Vec<_>>();
                 for (chunk_index, chunk) in chunks.iter().enumerate() {
-                    let page_id = next_page;
-                    next_page = checked_next_page(next_page)?;
+                    let page_id = if chunk_index == 0 {
+                        head
+                    } else {
+                        assigned.next().ok_or_else(|| {
+                            Error::Corrupt("missing assigned overflow page".into())
+                        })?
+                    };
+                    page_count = page_count.max(checked_next_page(page_id)?);
                     let next = if chunk_index + 1 == chunks.len() {
                         0
                     } else {
-                        next_page
+                        assigned_pages
+                            .iter()
+                            .position(|candidate| *candidate == page_id)
+                            .and_then(|index| assigned_pages.get(index + 1))
+                            .copied()
+                            .ok_or_else(|| Error::Corrupt("missing overflow successor".into()))?
                     };
                     pages.push((page_id, encode_overflow(chunk, next)?));
                 }
@@ -263,10 +327,13 @@ impl<'a> MutableTree<'a> {
             pages.push((page_id, page));
         }
         pages.sort_unstable_by_key(|(page_id, _)| *page_id);
+        let mut retired = self.retired;
+        retired.extend(self.dirty_by_original.keys().copied());
         Ok(FinishedTree {
             root: resolve_page(self.root, &physical)?,
-            page_count: next_page,
+            page_count,
             pages,
+            retired,
         })
     }
 
@@ -878,8 +945,8 @@ fn encode_internal(children: &[Child], physical: &[Option<u64>]) -> Result<[u8; 
     Ok(page)
 }
 
-pub(crate) fn get(
-    file: &File,
+pub(crate) fn get<I: PageIo + ?Sized>(
+    file: &I,
     cache: &Cache,
     root: u64,
     page_count: u64,
@@ -903,8 +970,8 @@ pub(crate) fn get(
     Err(Error::Corrupt("tree exceeds maximum depth".into()))
 }
 
-pub(crate) fn collect(
-    file: &File,
+pub(crate) fn collect<I: PageIo + ?Sized>(
+    file: &I,
     cache: &Cache,
     root: u64,
     page_count: u64,
@@ -927,8 +994,8 @@ struct Subtree {
     height: usize,
 }
 
-fn collect_node(
-    file: &File,
+fn collect_node<I: PageIo + ?Sized>(
+    file: &I,
     cache: &Cache,
     page_id: u64,
     page_count: u64,
@@ -1019,8 +1086,8 @@ fn collect_node(
     }
 }
 
-pub(crate) fn build(
-    file: &File,
+pub(crate) fn build<I: PageIo + ?Sized>(
+    file: &I,
     entries: &BTreeMap<Vec<u8>, Vec<u8>>,
     first_page: u64,
 ) -> Result<BuiltTree> {
@@ -1042,8 +1109,8 @@ pub(crate) fn build(
     })
 }
 
-fn build_leaves(
-    writer: &mut PageWriter<'_>,
+fn build_leaves<I: PageIo + ?Sized>(
+    writer: &mut PageWriter<'_, I>,
     entries: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> Result<Vec<NodeRef>> {
     if entries.is_empty() {
@@ -1098,7 +1165,10 @@ fn build_leaves(
     Ok(nodes)
 }
 
-fn build_internal_level(writer: &mut PageWriter<'_>, children: &[NodeRef]) -> Result<Vec<NodeRef>> {
+fn build_internal_level<I: PageIo + ?Sized>(
+    writer: &mut PageWriter<'_, I>,
+    children: &[NodeRef],
+) -> Result<Vec<NodeRef>> {
     let mut output = Vec::new();
     let mut start = 0;
     while start < children.len() {
@@ -1129,8 +1199,8 @@ fn build_internal_level(writer: &mut PageWriter<'_>, children: &[NodeRef]) -> Re
     Ok(output)
 }
 
-fn finish_node(
-    writer: &mut PageWriter<'_>,
+fn finish_node<I: PageIo + ?Sized>(
+    writer: &mut PageWriter<'_, I>,
     mut page: [u8; PAGE_SIZE],
     count: usize,
 ) -> Result<u64> {
@@ -1139,7 +1209,7 @@ fn finish_node(
     writer.write(page)
 }
 
-fn write_overflow(writer: &mut PageWriter<'_>, value: &[u8]) -> Result<u64> {
+fn write_overflow<I: PageIo + ?Sized>(writer: &mut PageWriter<'_, I>, value: &[u8]) -> Result<u64> {
     let chunks: Vec<&[u8]> = value.chunks(PAGE_END - OVERFLOW_HEADER).collect();
     let mut next = 0;
     for chunk in chunks.into_iter().rev() {
@@ -1153,8 +1223,8 @@ fn write_overflow(writer: &mut PageWriter<'_>, value: &[u8]) -> Result<u64> {
     Ok(next)
 }
 
-fn read_overflow(
-    file: &File,
+fn read_overflow<I: PageIo + ?Sized>(
+    file: &I,
     cache: &Cache,
     mut page_id: u64,
     page_count: u64,
@@ -1211,8 +1281,8 @@ fn read_overflow(
     Ok(value)
 }
 
-fn get_from_leaf(
-    file: &File,
+fn get_from_leaf<I: PageIo + ?Sized>(
+    file: &I,
     cache: &Cache,
     frame: Arc<Frame>,
     page_count: u64,
@@ -1450,12 +1520,12 @@ fn empty_page(kind: u8) -> [u8; PAGE_SIZE] {
     page
 }
 
-struct PageWriter<'a> {
-    file: &'a File,
+struct PageWriter<'a, I: PageIo + ?Sized> {
+    file: &'a I,
     next_page: u64,
 }
 
-impl PageWriter<'_> {
+impl<I: PageIo + ?Sized> PageWriter<'_, I> {
     fn write(&mut self, page: [u8; PAGE_SIZE]) -> Result<u64> {
         let page_id = self.next_page;
         io::write_page(self.file, page_id, &page)?;

@@ -1,10 +1,10 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::format::{self, PAGE_SIZE};
 use crate::io;
+use crate::io::PageIo;
 use crate::{Error, Result};
 
 pub(crate) struct Frame {
@@ -42,7 +42,12 @@ impl Cache {
         }
     }
 
-    pub fn get(&self, file: &File, page_id: u64, page_count: u64) -> Result<Arc<Frame>> {
+    pub fn get<I: PageIo + ?Sized>(
+        &self,
+        storage: &I,
+        page_id: u64,
+        page_count: u64,
+    ) -> Result<Arc<Frame>> {
         if page_id < format::META_PAGES || page_id >= page_count {
             return Err(Error::Corrupt(format!(
                 "page {page_id} is outside the snapshot"
@@ -56,7 +61,7 @@ impl Cache {
             frame.visited.store(true, Ordering::Relaxed);
             return Ok(Arc::clone(frame));
         }
-        let bytes = io::read_page(file, page_id)?;
+        let bytes = io::read_page(storage, page_id)?;
         format::validate_page(&bytes)?;
         let frame = Arc::new(Frame::new(bytes));
         state.frames.insert(page_id, Arc::clone(&frame));
@@ -73,6 +78,28 @@ impl Cache {
         state.frames.retain(|page, _| *page < first_page);
         state.queue.retain(|page| *page < first_page);
         Ok(())
+    }
+
+    pub fn invalidate_pages(&self, pages: &[u64]) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Corrupt("cache lock was poisoned".into()))?;
+        state.frames.retain(|page, _| !pages.contains(page));
+        state.queue.retain(|page| !pages.contains(page));
+        Ok(())
+    }
+
+    pub fn occupancy(&self) -> Result<(usize, usize, usize)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Corrupt("cache lock was poisoned".into()))?;
+        Ok((
+            state.frames.len(),
+            state.frames.len() * PAGE_SIZE,
+            self.capacity * PAGE_SIZE,
+        ))
     }
 
     fn evict(&self, state: &mut State) {
