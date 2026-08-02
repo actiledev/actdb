@@ -20,6 +20,12 @@ pub(crate) struct BuiltFreeTree {
     pub pages: Vec<(u64, [u8; PAGE_SIZE])>,
 }
 
+struct Subtree {
+    first: Option<u64>,
+    last: Option<u64>,
+    height: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct Layout {
     levels: Vec<usize>,
@@ -66,7 +72,7 @@ fn load_page<I: PageIo + ?Sized>(
     page_count: u64,
     loaded: &mut LoadedFreeTree,
     depth: usize,
-) -> Result<()> {
+) -> Result<Subtree> {
     if depth >= 64 || !loaded.pages.insert(page_id) {
         return Err(Error::Corrupt(
             "free tree contains a cycle or duplicate page".into(),
@@ -77,6 +83,7 @@ fn load_page<I: PageIo + ?Sized>(
     match frame.bytes[0] {
         FREE_LEAF => {
             validate_header(&frame.bytes, FREE_LEAF, count)?;
+            let mut first = None;
             let mut previous = None;
             for index in 0..count {
                 let slot = PAGE_HEADER + index * SLOT_SIZE;
@@ -92,8 +99,14 @@ fn load_page<I: PageIo + ?Sized>(
                         "free page IDs are not unique and ordered".into(),
                     ));
                 }
+                first.get_or_insert(free_page);
                 previous = Some(free_page);
             }
+            Ok(Subtree {
+                first,
+                last: previous,
+                height: 0,
+            })
         }
         FREE_INTERNAL => {
             validate_header(&frame.bytes, FREE_INTERNAL, count)?;
@@ -104,7 +117,12 @@ fn load_page<I: PageIo + ?Sized>(
             }
             let first = format::get_u64(&frame.bytes, 8)?;
             validate_child(first, page_count)?;
-            load_page(file, cache, first, page_count, loaded, depth + 1)?;
+            let mut subtree = load_page(file, cache, first, page_count, loaded, depth + 1)?;
+            if subtree.first.is_none() {
+                return Err(Error::Corrupt(
+                    "free internal page has an empty child".into(),
+                ));
+            }
             let mut previous = None;
             for index in 0..count {
                 let slot = PAGE_HEADER + index * SLOT_SIZE;
@@ -114,17 +132,30 @@ fn load_page<I: PageIo + ?Sized>(
                     return Err(Error::Corrupt("free separators are not ordered".into()));
                 }
                 validate_child(child, page_count)?;
-                load_page(file, cache, child, page_count, loaded, depth + 1)?;
+                let right = load_page(file, cache, child, page_count, loaded, depth + 1)?;
+                if right.first != Some(separator) {
+                    return Err(Error::Corrupt(
+                        "free separator does not match its right child".into(),
+                    ));
+                }
+                if subtree.last.is_none_or(|last| last >= separator) {
+                    return Err(Error::Corrupt("free child ranges overlap".into()));
+                }
+                if right.height != subtree.height {
+                    return Err(Error::Corrupt(
+                        "free-tree leaves have unequal depths".into(),
+                    ));
+                }
+                subtree.last = right.last;
                 previous = Some(separator);
             }
+            subtree.height += 1;
+            Ok(subtree)
         }
-        kind => {
-            return Err(Error::Corrupt(format!(
-                "unexpected free-tree page type {kind}"
-            )));
-        }
+        kind => Err(Error::Corrupt(format!(
+            "unexpected free-tree page type {kind}"
+        ))),
     }
-    Ok(())
 }
 
 pub(crate) fn build(
@@ -141,25 +172,23 @@ pub(crate) fn build(
             "free-tree layout has empty non-root leaves".into(),
         ));
     }
-    let records = entries
+    let mut records = entries
         .iter()
-        .map(|(&page, &generation)| (page, generation))
-        .collect::<Vec<_>>();
+        .map(|(&page, &generation)| (page, generation));
     let mut pages = Vec::with_capacity(page_ids.len());
     let mut nodes = Vec::with_capacity(leaf_count);
-    let mut cursor = 0;
+    let mut remaining_records = entries.len();
     for leaf_index in 0..leaf_count {
-        let remaining_records = records.len() - cursor;
         let remaining_leaves = leaf_count - leaf_index;
         let take = remaining_records
             .div_ceil(remaining_leaves)
             .min(LEAF_CAPACITY);
         let page_id = page_ids[pages.len()];
-        let slice = &records[cursor..cursor + take];
-        let first_key = slice.first().map_or(0, |record| record.0);
-        pages.push((page_id, encode_leaf(slice)?));
+        let leaf_records = records.by_ref().take(take).collect::<Vec<_>>();
+        let first_key = leaf_records.first().map_or(0, |record| record.0);
+        pages.push((page_id, encode_leaf(&leaf_records)?));
         nodes.push((first_key, page_id));
-        cursor += take;
+        remaining_records -= take;
     }
     for &node_count in &layout.levels[1..] {
         let mut next = Vec::with_capacity(node_count);
@@ -190,7 +219,7 @@ pub(crate) fn take_reusable(
     entries: &mut BTreeMap<u64, u64>,
     safe_generation: u64,
     count: usize,
-) -> Vec<u64> {
+) -> Vec<(u64, u64)> {
     if count == 0 {
         return Vec::new();
     }
@@ -200,10 +229,10 @@ pub(crate) fn take_reusable(
         .collect::<Vec<_>>();
     let selected =
         best_extent(&eligible, count).unwrap_or_else(|| eligible.into_iter().take(count).collect());
-    for page in &selected {
-        entries.remove(page);
-    }
     selected
+        .into_iter()
+        .filter_map(|page| entries.remove(&page).map(|generation| (page, generation)))
+        .collect()
 }
 
 fn best_extent(pages: &[u64], count: usize) -> Option<Vec<u64>> {
@@ -294,4 +323,40 @@ fn validate_child(page_id: u64, page_count: u64) -> Result<()> {
         return Err(Error::Corrupt("free-tree child is outside the file".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_should_reject_separator_that_does_not_match_right_child() -> Result<()> {
+        let file = tempfile::tempfile()?;
+        let page_count = 2_000;
+        file.set_len(page_count * format::PAGE_SIZE_U64)?;
+        let entries = (100..100 + LEAF_CAPACITY as u64 + 1)
+            .map(|page| (page, 1))
+            .collect::<BTreeMap<_, _>>();
+        let layout = Layout::for_entries(entries.len());
+        let allocations = (2..2 + layout.page_count() as u64).collect::<Vec<_>>();
+        let mut built = build(&entries, &layout, &allocations)?;
+        let (_, root) = built
+            .pages
+            .iter_mut()
+            .find(|(page, _)| *page == built.root)
+            .ok_or_else(|| Error::Corrupt("free-tree root was not built".into()))?;
+        let separator = format::get_u64(root, PAGE_HEADER)?;
+        format::put_u64(root, PAGE_HEADER, separator + 1);
+        format::finish_page(root);
+        for (page, bytes) in built.pages {
+            crate::io::write_page(&file, page, &bytes)?;
+        }
+
+        let cache = Cache::new(PAGE_SIZE * 4);
+        assert!(matches!(
+            load(&file, &cache, built.root, page_count),
+            Err(Error::Corrupt(_))
+        ));
+        Ok(())
+    }
 }

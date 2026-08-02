@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -80,7 +80,7 @@ impl Cache {
         Ok(())
     }
 
-    pub fn invalidate_pages(&self, pages: &[u64]) -> Result<()> {
+    pub fn invalidate_pages(&self, pages: &HashSet<u64>) -> Result<()> {
         let mut state = self
             .state
             .lock()

@@ -35,7 +35,7 @@ use std::fs::{File, OpenOptions};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 
 use cache::Cache;
 pub use error::{Error, Result};
@@ -124,6 +124,68 @@ struct FreeState {
     reusable_pages: u64,
 }
 
+struct FreeMutation<'a> {
+    entries: &'a mut BTreeMap<u64, u64>,
+    removed: Vec<(u64, u64)>,
+    inserted: Vec<u64>,
+    committed: bool,
+}
+
+impl<'a> FreeMutation<'a> {
+    fn new(entries: &'a mut BTreeMap<u64, u64>) -> Self {
+        Self {
+            entries,
+            removed: Vec::new(),
+            inserted: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn take_reusable(&mut self, safe_generation: u64, count: usize) -> Vec<u64> {
+        let removed = free::take_reusable(self.entries, safe_generation, count);
+        let pages = removed.iter().map(|&(page, _)| page).collect();
+        self.removed.extend(removed);
+        pages
+    }
+
+    fn insert(&mut self, page: u64, generation: u64) -> Result<()> {
+        match self.entries.entry(page) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(generation);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(Error::Corrupt(format!(
+                    "page {page} was retired more than once"
+                )));
+            }
+        }
+        self.inserted.push(page);
+        Ok(())
+    }
+
+    fn entries(&self) -> &BTreeMap<u64, u64> {
+        self.entries
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for FreeMutation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for page in &self.inserted {
+            self.entries.remove(page);
+        }
+        for &(page, generation) in &self.removed {
+            self.entries.insert(page, generation);
+        }
+    }
+}
+
 struct Inner {
     file: File,
     cache: Cache,
@@ -135,6 +197,22 @@ struct Inner {
 }
 
 impl Inner {
+    fn lock_publication_for_reuse(
+        &self,
+    ) -> Result<(RwLockWriteGuard<'_, Publication>, Option<u64>)> {
+        let publication = self
+            .published
+            .write()
+            .map_err(|_| Error::Corrupt("metadata lock was poisoned".into()))?;
+        let oldest_reader = self
+            .snapshots
+            .lock()
+            .map_err(|_| Error::Corrupt("snapshot registry was poisoned".into()))?
+            .first_key_value()
+            .map(|(&generation, _)| generation);
+        Ok((publication, oldest_reader))
+    }
+
     fn refresh_reusable_pages(&self) -> Result<()> {
         let publication = *self
             .published
@@ -710,41 +788,31 @@ impl WriteTxn<'_> {
                 .cache
                 .invalidate_from(self.base.meta.page_count)?;
         }
-        let publication = *self
-            .inner
-            .published
-            .read()
-            .map_err(|_| Error::Corrupt("metadata lock was poisoned".into()))?;
-        let oldest_reader = self
-            .inner
-            .snapshots
-            .lock()
-            .map_err(|_| Error::Corrupt("snapshot registry was poisoned".into()))?
-            .first_key_value()
-            .map(|(&generation, _)| generation);
-        let safe_floor = safe_generation(&publication, oldest_reader);
         let allocation_plan = self.tree.allocation_plan()?;
         let required_user_pages = allocation_plan.total_pages()?;
-        let (mut free_entries, old_free_pages) = {
-            let free_state = self
-                .inner
-                .free
-                .lock()
-                .map_err(|_| Error::Corrupt("free-tree state was poisoned".into()))?;
-            (free_state.entries.clone(), free_state.pages.clone())
-        };
+        // Exclude new snapshot registration before deciding which retired pages
+        // are safe to overwrite. Existing readers no longer need this lock.
+        let (mut publication, oldest_reader) = self.inner.lock_publication_for_reuse()?;
+        let safe_floor = safe_generation(&publication, oldest_reader);
+        let mut free_state = self
+            .inner
+            .free
+            .lock()
+            .map_err(|_| Error::Corrupt("free-tree state was poisoned".into()))?;
+        let old_free_pages = free_state.pages.clone();
+        let mut free_mutation = FreeMutation::new(&mut free_state.entries);
         let mut next_page = self.base.meta.page_count;
         let mut overflow_allocations = Vec::new();
         for chain_pages in allocation_plan.overflow_chains {
             overflow_allocations.extend(allocate_segment(
-                &mut free_entries,
+                &mut free_mutation,
                 safe_floor,
                 chain_pages,
                 &mut next_page,
             )?);
         }
         let mut user_allocations = allocate_segment(
-            &mut free_entries,
+            &mut free_mutation,
             safe_floor,
             allocation_plan.tree_pages,
             &mut next_page,
@@ -756,21 +824,20 @@ impl WriteTxn<'_> {
         let free_changed = !finished.pages.is_empty() || !finished.retired.is_empty();
         let (built_free, free_allocations) = if free_changed {
             for &page in &finished.retired {
-                free_entries.insert(page, self.base.meta.generation);
+                free_mutation.insert(page, self.base.meta.generation)?;
             }
             for &page in &old_free_pages {
-                free_entries.insert(page, self.base.meta.generation);
+                free_mutation.insert(page, self.base.meta.generation)?;
             }
-            let free_layout = free::Layout::for_entries(free_entries.len());
-            let mut allocations =
-                free::take_reusable(&mut free_entries, safe_floor, free_layout.page_count());
+            let free_layout = free::Layout::for_entries(free_mutation.entries().len());
+            let mut allocations = free_mutation.take_reusable(safe_floor, free_layout.page_count());
             while allocations.len() < free_layout.page_count() {
                 allocations.push(next_page);
                 next_page = next_page
                     .checked_add(1)
                     .ok_or_else(|| Error::Corrupt("database page count overflow".into()))?;
             }
-            let built = free::build(&free_entries, &free_layout, &allocations)?;
+            let built = free::build(free_mutation.entries(), &free_layout, &allocations)?;
             (built, allocations)
         } else {
             (
@@ -786,7 +853,7 @@ impl WriteTxn<'_> {
             .chain(&free_allocations)
             .copied()
             .filter(|page| *page < self.base.meta.page_count)
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
         self.inner.cache.invalidate_pages(&reused)?;
         let mut all_pages = finished.pages;
         all_pages.extend(built_free.pages);
@@ -820,7 +887,7 @@ impl WriteTxn<'_> {
             } else {
                 self.base.meta.free_tree_pages
             },
-            free_pages: free_entries.len() as u64,
+            free_pages: free_mutation.entries().len() as u64,
             fallback_pages: if free_changed {
                 finished.retired.len() as u64 + old_free_pages.len() as u64
             } else {
@@ -833,32 +900,15 @@ impl WriteTxn<'_> {
         if self.inner.durability == Durability::Strict {
             io::sync_all(&self.inner.file)?;
         }
-        let mut published = self
-            .inner
-            .published
-            .write()
-            .map_err(|_| Error::Corrupt("metadata lock was poisoned".into()))?;
         let current = Published { meta, slot };
-        published.current = current;
-        published.slots[slot as usize] = Some(meta);
-        let mut free_state = self
-            .inner
-            .free
-            .lock()
-            .map_err(|_| Error::Corrupt("free-tree state was poisoned".into()))?;
-        free_state.entries = free_entries;
+        publication.current = current;
+        publication.slots[slot as usize] = Some(meta);
+        free_mutation.commit();
         free_state.pages = free_allocations.into_iter().collect();
         free_state.generation_counts = generation_counts(&free_state.entries);
-        let oldest = self
-            .inner
-            .snapshots
-            .lock()
-            .map_err(|_| Error::Corrupt("snapshot registry was poisoned".into()))?
-            .first_key_value()
-            .map(|(&generation, _)| generation);
         free_state.reusable_pages = reusable_count(
             &free_state.generation_counts,
-            safe_generation(&published, oldest),
+            safe_generation(&publication, oldest_reader),
         );
         Ok(())
     }
@@ -1088,12 +1138,12 @@ fn reusable_count(counts: &BTreeMap<u64, u64>, safe_generation: u64) -> u64 {
 }
 
 fn allocate_segment(
-    entries: &mut BTreeMap<u64, u64>,
+    entries: &mut FreeMutation<'_>,
     safe_generation: u64,
     count: usize,
     next_page: &mut u64,
 ) -> Result<Vec<u64>> {
-    let mut allocated = free::take_reusable(entries, safe_generation, count);
+    let mut allocated = entries.take_reusable(safe_generation, count);
     while allocated.len() < count {
         allocated.push(*next_page);
         *next_page = next_page
@@ -1150,6 +1200,47 @@ fn within_end(key: &[u8], bound: Bound<&[u8]>) -> bool {
 mod fault_commit_tests {
     use super::*;
     use crate::io::fault::FaultDisk;
+
+    #[test]
+    fn failed_free_mutation_should_restore_in_memory_state() -> Result<()> {
+        let original = BTreeMap::from([(4, 1), (5, 1), (6, 2)]);
+        let mut entries = original.clone();
+        {
+            let mut mutation = FreeMutation::new(&mut entries);
+            assert_eq!(mutation.take_reusable(2, 2), vec![4, 5]);
+            mutation.insert(9, 3)?;
+        }
+        assert_eq!(entries, original);
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_publication_guard_should_exclude_new_snapshots() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("snapshot-gate.actdb"))?;
+        let existing = database.read()?;
+        let (publication, _) = database.inner.lock_publication_for_reuse()?;
+        let other = database.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sender.send(other.read().map(|_| ())).ok();
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        assert!(existing.is_empty());
+        drop(publication);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| Error::Corrupt(format!("snapshot did not resume: {error}")))??;
+        thread
+            .join()
+            .map_err(|_| Error::Corrupt("snapshot thread panicked".into()))?;
+        Ok(())
+    }
 
     #[test]
     fn crash_at_each_free_tree_publication_operation_should_recover_old_or_new() -> Result<()> {
