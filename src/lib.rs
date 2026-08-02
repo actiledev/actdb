@@ -41,7 +41,7 @@ use cache::Cache;
 pub use error::{Error, Result};
 use format::{MAX_KEY_SIZE, MAX_VALUE_SIZE, META_PAGES, Meta, PAGE_SIZE_U64};
 use io::PageIo;
-use tree::{FoundValue, ValueStorage};
+use tree::{Cursor, CursorEntry, CursorSnapshot, Direction, FoundValue, ValueStorage};
 
 const DEFAULT_CACHE_CAPACITY: usize = 16 * 1024 * 1024;
 static COMPACTION_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -278,6 +278,14 @@ pub struct DatabaseStats {
     pub cache_bytes: usize,
     /// Configured cache capacity in bytes.
     pub cache_capacity_bytes: usize,
+    /// Cache lookups served by an indexed frame.
+    pub cache_hits: u64,
+    /// Cache lookups that did not immediately find an indexed frame.
+    pub cache_misses: u64,
+    /// Pages successfully loaded and checksum-validated from storage.
+    pub cache_loads: u64,
+    /// Indexed frames removed by SIEVE eviction.
+    pub cache_evictions: u64,
     /// Current published generation.
     pub current_generation: u64,
 }
@@ -401,7 +409,10 @@ impl Database {
         }
         drop(publication);
         let transaction = ReadTxn {
-            inner: Arc::clone(&self.inner),
+            lease: Arc::new(SnapshotLease {
+                inner: Arc::clone(&self.inner),
+                generation: published.meta.generation,
+            }),
             meta: published.meta,
         };
         self.inner.refresh_reusable_pages()?;
@@ -484,6 +495,7 @@ impl Database {
             .map(|(&generation, _)| generation);
         let pinned_snapshots = snapshots.values().copied().sum();
         let (cache_pages, cache_bytes, cache_capacity_bytes) = self.inner.cache.occupancy()?;
+        let cache_metrics = self.inner.cache.metrics();
         let meta = publication.current.meta;
         Ok(DatabaseStats {
             logical_bytes: meta.logical_bytes,
@@ -500,6 +512,10 @@ impl Database {
             cache_pages,
             cache_bytes,
             cache_capacity_bytes,
+            cache_hits: cache_metrics.hits,
+            cache_misses: cache_metrics.misses,
+            cache_loads: cache_metrics.loads,
+            cache_evictions: cache_metrics.evictions,
             current_generation: meta.generation,
         })
     }
@@ -556,21 +572,26 @@ impl Database {
 ///
 /// Point-read guards and owning scan results may outlive this transaction.
 pub struct ReadTxn {
-    inner: Arc<Inner>,
+    lease: Arc<SnapshotLease>,
     meta: Meta,
 }
 
-impl Drop for ReadTxn {
+struct SnapshotLease {
+    inner: Arc<Inner>,
+    generation: u64,
+}
+
+impl Drop for SnapshotLease {
     fn drop(&mut self) {
         let mut snapshots = self
             .inner
             .snapshots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = snapshots.get_mut(&self.meta.generation) {
+        if let Some(count) = snapshots.get_mut(&self.generation) {
             *count -= 1;
             if *count == 0 {
-                snapshots.remove(&self.meta.generation);
+                snapshots.remove(&self.generation);
             }
         }
         drop(snapshots);
@@ -590,8 +611,8 @@ impl ReadTxn {
     pub fn get(&self, key: &[u8]) -> Result<Option<ValueGuard>> {
         validate_key(key)?;
         tree::get(
-            &self.inner.file,
-            &self.inner.cache,
+            &self.lease.inner.file,
+            &self.lease.inner.cache,
             self.meta.root,
             self.meta.page_count,
             key,
@@ -620,32 +641,80 @@ impl ReadTxn {
         self.len() == 0
     }
 
-    /// Creates a forward scan over the supplied lexicographic bounds.
-    ///
-    /// Scan entries are owned so callers may retain them without pinning cache
-    /// pages. An unbounded side uses [`Bound::Unbounded`].
+    /// Creates a lazy forward scan over the supplied lexicographic bounds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the tree cannot be decoded or either bound exceeds
-    /// the key-size limit.
+    /// Returns an error if the initial tree path cannot be decoded or either
+    /// bound exceeds the key-size limit. Later failures are returned by the
+    /// iterator.
     pub fn scan(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Result<Scan> {
+        self.scan_direction(start, end, Direction::Forward)
+    }
+
+    /// Creates a lazy reverse scan over the supplied lexicographic bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ReadTxn::scan`].
+    pub fn scan_reverse(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Result<Scan> {
+        self.scan_direction(start, end, Direction::Reverse)
+    }
+
+    /// Creates a lazy forward scan of keys beginning with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix exceeds the key-size limit or the initial
+    /// tree path cannot be decoded.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Scan> {
+        self.scan_prefix_direction(prefix, Direction::Forward)
+    }
+
+    /// Creates a lazy reverse scan of keys beginning with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ReadTxn::scan_prefix`].
+    pub fn scan_prefix_reverse(&self, prefix: &[u8]) -> Result<Scan> {
+        self.scan_prefix_direction(prefix, Direction::Reverse)
+    }
+
+    fn scan_prefix_direction(&self, prefix: &[u8], direction: Direction) -> Result<Scan> {
+        validate_key(prefix)?;
+        let end = prefix_end(prefix);
+        self.scan_direction(
+            Bound::Included(prefix),
+            end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+            direction,
+        )
+    }
+
+    fn scan_direction(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        direction: Direction,
+    ) -> Result<Scan> {
         validate_bound(start)?;
         validate_bound(end)?;
-        let entries = tree::collect(
-            &self.inner.file,
-            &self.inner.cache,
-            self.meta.root,
-            self.meta.page_count,
-            self.meta.item_count,
+        let cursor = Cursor::new(
+            &self.lease.inner.file,
+            &self.lease.inner.cache,
+            CursorSnapshot {
+                root: self.meta.root,
+                page_count: self.meta.page_count,
+                item_count: self.meta.item_count,
+            },
+            start,
+            end,
+            direction,
         )?;
-        let rows = entries
-            .into_iter()
-            .filter(|(key, _)| within_start(key, start) && within_end(key, end))
-            .map(|(key, value)| (key.into_boxed_slice(), value.into_boxed_slice()))
-            .collect::<Vec<_>>()
-            .into_iter();
-        Ok(Scan { rows })
+        Ok(Scan {
+            cursor,
+            lease: Arc::clone(&self.lease),
+            failed: false,
+        })
     }
 }
 
@@ -962,29 +1031,109 @@ impl std::fmt::Debug for ValueGuard {
     }
 }
 
-/// An owning forward iterator returned by [`ReadTxn::scan`].
+/// A lazy range iterator returned by the scan methods on [`ReadTxn`].
 ///
-/// The current iterator eagerly owns every matching entry and may outlive its
-/// originating read transaction without pinning cache pages.
+/// A scan retains its snapshot and may outlive the transaction that created it.
+/// Each yielded item can fail independently when traversal reaches unread data.
 pub struct Scan {
-    rows: std::vec::IntoIter<ScanEntry>,
+    cursor: Cursor,
+    lease: Arc<SnapshotLease>,
+    failed: bool,
 }
 
-type ScanEntry = (Box<[u8]>, Box<[u8]>);
+impl Scan {
+    /// Repositions this scan in its existing direction and original bounds.
+    ///
+    /// Forward scans select the first key at or after the supplied bound;
+    /// reverse scans select the last key at or before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized key, I/O failure, or corrupt page.
+    pub fn seek(&mut self, target: Bound<&[u8]>) -> Result<()> {
+        if self.failed {
+            return Err(Error::ScanClosed);
+        }
+        validate_bound(target)?;
+        match self
+            .cursor
+            .seek(&self.lease.inner.file, &self.lease.inner.cache, target)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+}
 
 impl Iterator for Scan {
-    type Item = (Box<[u8]>, Box<[u8]>);
+    type Item = Result<EntryGuard>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.rows.next()
+        if self.failed {
+            return None;
+        }
+        match self
+            .cursor
+            .next(&self.lease.inner.file, &self.lease.inner.cache)
+        {
+            Ok(Some(entry)) => Some(Ok(EntryGuard {
+                entry,
+                lease: Arc::clone(&self.lease),
+                page_count: self.cursor.page_count(),
+            })),
+            Ok(None) => None,
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.rows.size_hint()
+        (0, None)
     }
 }
 
-impl ExactSizeIterator for Scan {}
+impl std::iter::FusedIterator for Scan {}
+
+/// A key/value entry yielded by a lazy scan.
+///
+/// The key and inline value remain in their immutable leaf frame. Overflow
+/// bytes are not read or assembled until [`EntryGuard::value`] is called.
+pub struct EntryGuard {
+    entry: CursorEntry,
+    lease: Arc<SnapshotLease>,
+    page_count: u64,
+}
+
+impl EntryGuard {
+    /// Returns this entry's key without copying it from the leaf frame.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        self.entry.key()
+    }
+
+    /// Returns this entry's value.
+    ///
+    /// Inline values borrow the leaf frame. Overflow values are assembled into
+    /// contiguous owned storage on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or corruption error while reading an overflow chain.
+    pub fn value(&self) -> Result<ValueGuard> {
+        self.entry
+            .value(
+                &self.lease.inner.file,
+                &self.lease.inner.cache,
+                self.page_count,
+            )
+            .map(ValueGuard::from)
+    }
+}
 
 fn initialize<I: PageIo + ?Sized>(file: &I) -> Result<Publication> {
     io::set_len(file, META_PAGES * PAGE_SIZE_U64)?;
@@ -1180,20 +1329,15 @@ fn validate_bound(bound: Bound<&[u8]>) -> Result<()> {
     }
 }
 
-fn within_start(key: &[u8], bound: Bound<&[u8]>) -> bool {
-    match bound {
-        Bound::Included(start) => key >= start,
-        Bound::Excluded(start) => key > start,
-        Bound::Unbounded => true,
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last != u8::MAX {
+            end.push(last + 1);
+            return Some(end);
+        }
     }
-}
-
-fn within_end(key: &[u8], bound: Bound<&[u8]>) -> bool {
-    match bound {
-        Bound::Included(end) => key <= end,
-        Bound::Excluded(end) => key < end,
-        Bound::Unbounded => true,
-    }
+    None
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ assert_eq!(read.get(b"user:42")?.as_deref(), Some(b"Ada".as_slice()));
 - Atomic batch commits with strict and relaxed durability
 - Stable snapshot readers and one serialized writer
 - Zero-copy point reads for inline values
+- Lazy forward/reverse range and prefix scans
 - Values up to 4 GiB through overflow pages
 - Bounded SIEVE-style page cache
 - Persistent generation-safe page reclamation
@@ -38,6 +39,22 @@ and targets 64-bit Linux, macOS, and Windows with Rust 1.89 or newer.
 ## Documentation
 
 Soon
+
+Lazy scans return guarded entries and surface storage failures per item:
+
+```rust
+use std::ops::Bound;
+
+# use actdb::Database;
+# let dir = tempfile::tempdir()?;
+# let db = Database::open(dir.path().join("scan.actdb"))?;
+let read = db.read()?;
+for entry in read.scan(Bound::Included(b"user:"), Bound::Excluded(b"user;"))? {
+    let entry = entry?;
+    println!("{:?}: {} bytes", entry.key(), entry.value()?.len());
+}
+# Ok::<(), actdb::Error>(())
+```
 
 ## Development
 

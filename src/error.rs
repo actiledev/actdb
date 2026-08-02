@@ -41,6 +41,9 @@ pub enum Error {
     /// A transaction cannot continue after an earlier failure.
     #[error("transaction is no longer usable")]
     TransactionClosed,
+    /// A scan cannot continue after an earlier traversal or seek failure.
+    #[error("scan is no longer usable")]
+    ScanClosed,
 }
 
 /// A result returned by actdb.

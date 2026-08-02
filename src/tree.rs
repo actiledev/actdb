@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -24,6 +25,120 @@ pub(crate) enum ValueStorage {
 }
 
 pub(crate) struct FoundValue(pub ValueStorage);
+
+#[derive(Clone, Copy)]
+pub(crate) enum Direction {
+    Forward,
+    Reverse,
+}
+
+#[derive(Clone)]
+enum KeyBound {
+    Included(Box<[u8]>),
+    Excluded(Box<[u8]>),
+    Unbounded,
+}
+
+impl KeyBound {
+    fn from_bound(bound: Bound<&[u8]>) -> Self {
+        match bound {
+            Bound::Included(key) => Self::Included(Box::from(key)),
+            Bound::Excluded(key) => Self::Excluded(Box::from(key)),
+            Bound::Unbounded => Self::Unbounded,
+        }
+    }
+
+    fn as_bound(&self) -> Bound<&[u8]> {
+        match self {
+            Self::Included(key) => Bound::Included(key),
+            Self::Excluded(key) => Bound::Excluded(key),
+            Self::Unbounded => Bound::Unbounded,
+        }
+    }
+}
+
+struct PathFrame {
+    page_id: u64,
+    child: usize,
+    child_count: usize,
+}
+
+struct LeafPosition {
+    frame: Arc<Frame>,
+    index: usize,
+    count: usize,
+}
+
+pub(crate) struct CursorEntry {
+    frame: Arc<Frame>,
+    key_range: Range<usize>,
+    value_range: Range<usize>,
+    value_len: usize,
+    overflow: u64,
+}
+
+impl CursorEntry {
+    pub fn key(&self) -> &[u8] {
+        &self.frame.bytes[self.key_range.clone()]
+    }
+
+    pub fn value<I: PageIo + ?Sized>(
+        &self,
+        file: &I,
+        cache: &Cache,
+        page_count: u64,
+    ) -> Result<FoundValue> {
+        if self.overflow == 0 {
+            return Ok(FoundValue(ValueStorage::Inline {
+                frame: Arc::clone(&self.frame),
+                range: self.value_range.clone(),
+            }));
+        }
+        read_overflow(file, cache, self.overflow, page_count, self.value_len, None)
+            .map(|value| FoundValue(ValueStorage::Owned(Arc::from(value))))
+    }
+}
+
+pub(crate) struct Cursor {
+    root: u64,
+    page_count: u64,
+    direction: Direction,
+    start: KeyBound,
+    end: KeyBound,
+    path: Vec<PathFrame>,
+    leaf: Option<LeafPosition>,
+    finished: bool,
+    last_key: Option<Box<[u8]>>,
+    emitted: u64,
+    expected_items: Option<u64>,
+    count_checked: bool,
+    needs_advance: bool,
+}
+
+pub(crate) struct CursorSnapshot {
+    pub root: u64,
+    pub page_count: u64,
+    pub item_count: u64,
+}
+
+enum DecodedTreePage<'a> {
+    Leaf(&'a [u8; PAGE_SIZE]),
+    Internal(&'a [u8; PAGE_SIZE]),
+}
+
+fn decode_tree_page(page: &[u8; PAGE_SIZE], page_count: u64) -> Result<DecodedTreePage<'_>> {
+    match page[0] {
+        LEAF => {
+            validate_leaf(page)?;
+            Ok(DecodedTreePage::Leaf(page))
+        }
+        INTERNAL => {
+            validate_internal(page, page_count)?;
+            Ok(DecodedTreePage::Internal(page))
+        }
+        kind => Err(Error::Corrupt(format!("unexpected tree page type {kind}"))),
+    }
+}
 
 #[derive(Clone)]
 struct NodeRef {
@@ -129,15 +244,14 @@ impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
             match page {
                 PageRef::Committed(page_id) => {
                     let frame = self.cache.get(self.file, page_id, self.page_count)?;
-                    match frame.bytes[0] {
-                        LEAF => {
-                            validate_leaf(&frame.bytes)?;
-                            let count = usize::from(format::get_u16(&frame.bytes, 2)?);
-                            let index = leaf_search(&frame.bytes, count, key)?;
+                    match decode_tree_page(&frame.bytes, self.page_count)? {
+                        DecodedTreePage::Leaf(decoded) => {
+                            let count = usize::from(format::get_u16(decoded, 2)?);
+                            let index = leaf_search(decoded, count, key)?;
                             let Some(index) = index else {
                                 return Ok(None);
                             };
-                            let slot = leaf_slot(&frame.bytes, index)?;
+                            let slot = leaf_slot(decoded, index)?;
                             if slot.overflow == 0 {
                                 return Ok(Some(Arc::from(
                                     &frame.bytes[slot.value_range] as &[u8],
@@ -153,14 +267,8 @@ impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
                             )
                             .map(|value| Some(Arc::from(value)));
                         }
-                        INTERNAL => {
-                            validate_internal(&frame.bytes, self.page_count)?;
-                            page = PageRef::Committed(internal_child(&frame.bytes, key)?);
-                        }
-                        kind => {
-                            return Err(Error::Corrupt(format!(
-                                "unexpected tree page type {kind}"
-                            )));
+                        DecodedTreePage::Internal(decoded) => {
+                            page = PageRef::Committed(internal_child(decoded, key)?);
                         }
                     }
                 }
@@ -540,13 +648,12 @@ impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
             return Err(Error::Corrupt("tree exceeds maximum depth".into()));
         }
         let frame = self.cache.get(self.file, page_id, self.page_count)?;
-        match frame.bytes[0] {
-            LEAF => {
-                validate_leaf(&frame.bytes)?;
-                let count = usize::from(format::get_u16(&frame.bytes, 2)?);
+        match decode_tree_page(&frame.bytes, self.page_count)? {
+            DecodedTreePage::Leaf(decoded) => {
+                let count = usize::from(format::get_u16(decoded, 2)?);
                 let mut entries = Vec::with_capacity(count);
                 for index in 0..count {
-                    let slot = leaf_slot(&frame.bytes, index)?;
+                    let slot = leaf_slot(decoded, index)?;
                     let value = if slot.overflow == 0 {
                         StoredValue::Inline(Arc::from(
                             &frame.bytes[slot.value_range.clone()] as &[u8],
@@ -564,10 +671,9 @@ impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
                 }
                 Ok(MutableNode::Leaf(entries))
             }
-            INTERNAL => {
-                validate_internal(&frame.bytes, self.page_count)?;
-                let count = usize::from(format::get_u16(&frame.bytes, 2)?);
-                let first = format::get_u64(&frame.bytes, 8)?;
+            DecodedTreePage::Internal(decoded) => {
+                let count = usize::from(format::get_u16(decoded, 2)?);
+                let first = format::get_u64(decoded, 8)?;
                 let mut children = Vec::with_capacity(count + 1);
                 children.push(Child {
                     first_key: self.first_key(PageRef::Committed(first), depth + 1)?,
@@ -576,13 +682,12 @@ impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
                 for index in 0..count {
                     let slot = PAGE_HEADER + index * SLOT_SIZE;
                     children.push(Child {
-                        first_key: internal_key(&frame.bytes, index)?.to_vec(),
-                        page: PageRef::Committed(format::get_u64(&frame.bytes, slot + 8)?),
+                        first_key: internal_key(decoded, index)?.to_vec(),
+                        page: PageRef::Committed(format::get_u64(decoded, slot + 8)?),
                     });
                 }
                 Ok(MutableNode::Internal(children))
             }
-            kind => Err(Error::Corrupt(format!("unexpected tree page type {kind}"))),
         }
     }
 
@@ -602,23 +707,17 @@ impl<'a, I: PageIo + ?Sized> MutableTree<'a, I> {
             },
             PageRef::Committed(page_id) => {
                 let frame = self.cache.get(self.file, page_id, self.page_count)?;
-                match frame.bytes[0] {
-                    LEAF => {
-                        validate_leaf(&frame.bytes)?;
-                        if format::get_u16(&frame.bytes, 2)? == 0 {
+                match decode_tree_page(&frame.bytes, self.page_count)? {
+                    DecodedTreePage::Leaf(decoded) => {
+                        if format::get_u16(decoded, 2)? == 0 {
                             Ok(Vec::new())
                         } else {
-                            Ok(frame.bytes[leaf_slot(&frame.bytes, 0)?.key_range].to_vec())
+                            Ok(decoded[leaf_slot(decoded, 0)?.key_range].to_vec())
                         }
                     }
-                    INTERNAL => {
-                        validate_internal(&frame.bytes, self.page_count)?;
-                        self.first_key(
-                            PageRef::Committed(format::get_u64(&frame.bytes, 8)?),
-                            depth + 1,
-                        )
+                    DecodedTreePage::Internal(decoded) => {
+                        self.first_key(PageRef::Committed(format::get_u64(decoded, 8)?), depth + 1)
                     }
-                    kind => Err(Error::Corrupt(format!("unexpected tree page type {kind}"))),
                 }
             }
         }
@@ -955,16 +1054,13 @@ pub(crate) fn get<I: PageIo + ?Sized>(
     let mut page_id = root;
     for _ in 0..64 {
         let frame = cache.get(file, page_id, page_count)?;
-        match frame.bytes[0] {
-            LEAF => {
-                validate_leaf(&frame.bytes)?;
+        match decode_tree_page(&frame.bytes, page_count)? {
+            DecodedTreePage::Leaf(_) => {
                 return get_from_leaf(file, cache, frame, page_count, key);
             }
-            INTERNAL => {
-                validate_internal(&frame.bytes, page_count)?;
-                page_id = internal_child(&frame.bytes, key)?;
+            DecodedTreePage::Internal(page) => {
+                page_id = internal_child(page, key)?;
             }
-            kind => return Err(Error::Corrupt(format!("unexpected tree page type {kind}"))),
         }
     }
     Err(Error::Corrupt("tree exceeds maximum depth".into()))
@@ -986,6 +1082,373 @@ pub(crate) fn collect<I: PageIo + ?Sized>(
         ));
     }
     Ok(result)
+}
+
+impl Cursor {
+    pub fn new<I: PageIo + ?Sized>(
+        file: &I,
+        cache: &Cache,
+        snapshot: CursorSnapshot,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        direction: Direction,
+    ) -> Result<Self> {
+        let complete = matches!(start, Bound::Unbounded) && matches!(end, Bound::Unbounded);
+        let mut cursor = Self {
+            root: snapshot.root,
+            page_count: snapshot.page_count,
+            direction,
+            start: KeyBound::from_bound(start),
+            end: KeyBound::from_bound(end),
+            path: Vec::new(),
+            leaf: None,
+            finished: false,
+            last_key: None,
+            emitted: 0,
+            expected_items: complete.then_some(snapshot.item_count),
+            count_checked: false,
+            needs_advance: false,
+        };
+        cursor.reposition(file, cache, None)?;
+        Ok(cursor)
+    }
+
+    pub fn seek<I: PageIo + ?Sized>(
+        &mut self,
+        file: &I,
+        cache: &Cache,
+        target: Bound<&[u8]>,
+    ) -> Result<()> {
+        self.expected_items = None;
+        self.reposition(file, cache, Some(target))
+    }
+
+    pub fn next<I: PageIo + ?Sized>(
+        &mut self,
+        file: &I,
+        cache: &Cache,
+    ) -> Result<Option<CursorEntry>> {
+        if self.finished {
+            return self.finish_count();
+        }
+        if self.needs_advance {
+            self.needs_advance = false;
+            self.advance(file, cache)?;
+            if self.finished {
+                return self.finish_count();
+            }
+        }
+        let Some(leaf) = &mut self.leaf else {
+            self.finished = true;
+            return self.finish_count();
+        };
+        if leaf.index >= leaf.count {
+            return Err(Error::Corrupt("cursor leaf position is invalid".into()));
+        }
+        let slot = leaf_slot(&leaf.frame.bytes, leaf.index)?;
+        let key = &leaf.frame.bytes[slot.key_range.clone()];
+        if !within_bounds(key, self.start.as_bound(), self.end.as_bound()) {
+            self.finished = true;
+            self.leaf = None;
+            self.path.clear();
+            return Ok(None);
+        }
+        if self
+            .last_key
+            .as_deref()
+            .is_some_and(|previous| match self.direction {
+                Direction::Forward => previous >= key,
+                Direction::Reverse => previous <= key,
+            })
+        {
+            return Err(Error::Corrupt(
+                "cursor encountered keys outside strict traversal order".into(),
+            ));
+        }
+        self.last_key = Some(Box::from(key));
+        self.emitted = self
+            .emitted
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("scan item count overflow".into()))?;
+        let entry = CursorEntry {
+            frame: Arc::clone(&leaf.frame),
+            key_range: slot.key_range,
+            value_range: slot.value_range,
+            value_len: slot.value_len,
+            overflow: slot.overflow,
+        };
+        match self.direction {
+            Direction::Forward if leaf.index + 1 < leaf.count => leaf.index += 1,
+            Direction::Reverse if leaf.index > 0 => leaf.index -= 1,
+            Direction::Forward | Direction::Reverse => self.needs_advance = true,
+        }
+        Ok(Some(entry))
+    }
+
+    pub fn page_count(&self) -> u64 {
+        self.page_count
+    }
+
+    fn reposition<I: PageIo + ?Sized>(
+        &mut self,
+        file: &I,
+        cache: &Cache,
+        target: Option<Bound<&[u8]>>,
+    ) -> Result<()> {
+        self.path.clear();
+        self.leaf = None;
+        self.finished = false;
+        self.last_key = None;
+        self.emitted = 0;
+        self.count_checked = false;
+        self.needs_advance = false;
+        let original = match self.direction {
+            Direction::Forward => self.start.clone(),
+            Direction::Reverse => self.end.clone(),
+        };
+        let bound = match self.direction {
+            Direction::Forward => tighter_lower(original.as_bound(), target),
+            Direction::Reverse => tighter_upper(original.as_bound(), target),
+        };
+        self.descend(file, cache, self.root, bound)?;
+        if self.leaf.is_none() {
+            self.finished = true;
+        }
+        Ok(())
+    }
+
+    fn finish_count(&mut self) -> Result<Option<CursorEntry>> {
+        if self.count_checked {
+            return Ok(None);
+        }
+        self.count_checked = true;
+        if self
+            .expected_items
+            .is_some_and(|expected| expected != self.emitted)
+        {
+            return Err(Error::Corrupt(
+                "metadata item count does not match the tree".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn descend<I: PageIo + ?Sized>(
+        &mut self,
+        file: &I,
+        cache: &Cache,
+        mut page_id: u64,
+        bound: Bound<&[u8]>,
+    ) -> Result<()> {
+        for _ in self.path.len()..64 {
+            if self.path.iter().any(|frame| frame.page_id == page_id) {
+                return Err(Error::Corrupt("tree contains a cycle".into()));
+            }
+            let frame = cache.get(file, page_id, self.page_count)?;
+            match decode_tree_page(&frame.bytes, self.page_count)? {
+                DecodedTreePage::Leaf(page) => {
+                    let count = usize::from(format::get_u16(page, 2)?);
+                    if count == 0 {
+                        self.leaf = None;
+                        return Ok(());
+                    }
+                    let index = match self.direction {
+                        Direction::Forward => leaf_lower_index(page, count, bound)?,
+                        Direction::Reverse => leaf_upper_index(page, count, bound)?,
+                    };
+                    self.leaf = index.map(|index| LeafPosition {
+                        frame,
+                        index,
+                        count,
+                    });
+                    if self.leaf.is_none() {
+                        self.advance(file, cache)?;
+                    }
+                    return Ok(());
+                }
+                DecodedTreePage::Internal(page) => {
+                    let child_count = usize::from(format::get_u16(page, 2)?).saturating_add(1);
+                    let child = match bound {
+                        Bound::Included(key) | Bound::Excluded(key) => {
+                            internal_child_index(page, key)?
+                        }
+                        Bound::Unbounded => match self.direction {
+                            Direction::Forward => 0,
+                            Direction::Reverse => child_count - 1,
+                        },
+                    };
+                    let next = internal_child_at(page, child)?;
+                    self.path.push(PathFrame {
+                        page_id,
+                        child,
+                        child_count,
+                    });
+                    page_id = next;
+                }
+            }
+        }
+        Err(Error::Corrupt("tree exceeds maximum depth".into()))
+    }
+
+    fn advance<I: PageIo + ?Sized>(&mut self, file: &I, cache: &Cache) -> Result<()> {
+        if let Some(leaf) = &mut self.leaf {
+            match self.direction {
+                Direction::Forward if leaf.index + 1 < leaf.count => {
+                    leaf.index += 1;
+                    return Ok(());
+                }
+                Direction::Reverse if leaf.index > 0 => {
+                    leaf.index -= 1;
+                    return Ok(());
+                }
+                Direction::Forward | Direction::Reverse => {}
+            }
+        }
+        self.leaf = None;
+        while let Some(mut parent) = self.path.pop() {
+            let sibling = match self.direction {
+                Direction::Forward if parent.child + 1 < parent.child_count => {
+                    parent.child += 1;
+                    Some(parent.child)
+                }
+                Direction::Reverse if parent.child > 0 => {
+                    parent.child -= 1;
+                    Some(parent.child)
+                }
+                Direction::Forward | Direction::Reverse => None,
+            };
+            let Some(sibling) = sibling else {
+                continue;
+            };
+            let frame = cache.get(file, parent.page_id, self.page_count)?;
+            let DecodedTreePage::Internal(page) = decode_tree_page(&frame.bytes, self.page_count)?
+            else {
+                return Err(Error::Corrupt("cursor parent is not internal".into()));
+            };
+            let child = internal_child_at(page, sibling)?;
+            self.path.push(parent);
+            self.descend(file, cache, child, Bound::Unbounded)?;
+            return Ok(());
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+fn leaf_lower_index(
+    page: &[u8; PAGE_SIZE],
+    count: usize,
+    bound: Bound<&[u8]>,
+) -> Result<Option<usize>> {
+    let index = partition_leaf(page, count, |key| match bound {
+        Bound::Included(target) => key < target,
+        Bound::Excluded(target) => key <= target,
+        Bound::Unbounded => false,
+    })?;
+    Ok((index < count).then_some(index))
+}
+
+fn leaf_upper_index(
+    page: &[u8; PAGE_SIZE],
+    count: usize,
+    bound: Bound<&[u8]>,
+) -> Result<Option<usize>> {
+    let index = partition_leaf(page, count, |key| match bound {
+        Bound::Included(target) => key <= target,
+        Bound::Excluded(target) => key < target,
+        Bound::Unbounded => true,
+    })?;
+    Ok(index.checked_sub(1))
+}
+
+fn partition_leaf(
+    page: &[u8; PAGE_SIZE],
+    count: usize,
+    mut before: impl FnMut(&[u8]) -> bool,
+) -> Result<usize> {
+    let mut low = 0;
+    let mut high = count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let slot = leaf_slot(page, middle)?;
+        if before(&page[slot.key_range]) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(low)
+}
+
+fn tighter_lower<'a>(
+    original: Bound<&'a [u8]>,
+    target: Option<Bound<&'a [u8]>>,
+) -> Bound<&'a [u8]> {
+    let Some(target) = target else {
+        return original;
+    };
+    tighter_bound(original, target, true)
+}
+
+fn tighter_upper<'a>(
+    original: Bound<&'a [u8]>,
+    target: Option<Bound<&'a [u8]>>,
+) -> Bound<&'a [u8]> {
+    let Some(target) = target else {
+        return original;
+    };
+    tighter_bound(original, target, false)
+}
+
+fn tighter_bound<'a>(
+    left: Bound<&'a [u8]>,
+    right: Bound<&'a [u8]>,
+    lower: bool,
+) -> Bound<&'a [u8]> {
+    match (left, right) {
+        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
+        (left, right) => {
+            let Some(left_key) = bound_key(left) else {
+                unreachable!("unbounded cases were handled above");
+            };
+            let Some(right_key) = bound_key(right) else {
+                unreachable!("unbounded cases were handled above");
+            };
+            match left_key.cmp(right_key) {
+                std::cmp::Ordering::Greater if lower => left,
+                std::cmp::Ordering::Less if !lower => left,
+                std::cmp::Ordering::Equal
+                    if matches!(left, Bound::Excluded(_))
+                        || matches!(right, Bound::Excluded(_)) =>
+                {
+                    Bound::Excluded(left_key)
+                }
+                std::cmp::Ordering::Equal => left,
+                _ => right,
+            }
+        }
+    }
+}
+
+fn bound_key(bound: Bound<&[u8]>) -> Option<&[u8]> {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => Some(key),
+        Bound::Unbounded => None,
+    }
+}
+
+fn within_bounds(key: &[u8], start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+    let after_start = match start {
+        Bound::Included(start) => key >= start,
+        Bound::Excluded(start) => key > start,
+        Bound::Unbounded => true,
+    };
+    let before_end = match end {
+        Bound::Included(end) => key <= end,
+        Bound::Excluded(end) => key < end,
+        Bound::Unbounded => true,
+    };
+    after_start && before_end
 }
 
 struct Subtree {
@@ -1314,21 +1777,32 @@ fn get_from_leaf<I: PageIo + ?Sized>(
 }
 
 fn internal_child(page: &[u8; PAGE_SIZE], key: &[u8]) -> Result<u64> {
+    internal_child_at(page, internal_child_index(page, key)?)
+}
+
+fn internal_child_index(page: &[u8; PAGE_SIZE], key: &[u8]) -> Result<usize> {
     let count = usize::from(format::get_u16(page, 2)?);
-    let mut child = format::get_u64(page, 8)?;
+    let mut child = 0;
     for index in 0..count {
-        let offset = PAGE_HEADER + index * SLOT_SIZE;
-        let data_offset = usize::from(format::get_u16(page, offset)?);
-        let key_len = usize::from(format::get_u16(page, offset + 2)?);
-        let separator = page
-            .get(data_offset..data_offset + key_len)
-            .ok_or_else(|| Error::Corrupt("internal key exceeds page".into()))?;
+        let separator = internal_key(page, index)?;
         if key < separator {
             break;
         }
-        child = format::get_u64(page, offset + 8)?;
+        child = index + 1;
     }
     Ok(child)
+}
+
+fn internal_child_at(page: &[u8; PAGE_SIZE], index: usize) -> Result<u64> {
+    let count = usize::from(format::get_u16(page, 2)?);
+    if index > count {
+        return Err(Error::Corrupt("internal child index exceeds page".into()));
+    }
+    if index == 0 {
+        format::get_u64(page, 8)
+    } else {
+        format::get_u64(page, PAGE_HEADER + (index - 1) * SLOT_SIZE + 8)
+    }
 }
 
 fn internal_key(page: &[u8; PAGE_SIZE], index: usize) -> Result<&[u8]> {
@@ -1397,7 +1871,7 @@ fn validate_leaf(page: &[u8; PAGE_SIZE]) -> Result<()> {
     validate_reserved(page, LEAF)?;
     let count = slot_count(page)?;
     let mut previous: Option<&[u8]> = None;
-    let mut ranges = Vec::with_capacity(count);
+    let mut occupied = [0_u64; PAGE_SIZE / u64::BITS as usize];
     for index in 0..count {
         let slot = leaf_slot(page, index)?;
         let key = &page[slot.key_range.clone()];
@@ -1413,10 +1887,10 @@ fn validate_leaf(page: &[u8; PAGE_SIZE]) -> Result<()> {
         if slot.overflow != 0 && slot.value_len <= INLINE_VALUE_LIMIT {
             return Err(Error::Corrupt("small value uses overflow storage".into()));
         }
-        ranges.push(slot.key_range.start..slot.value_range.end);
+        mark_range(&mut occupied, slot.key_range.start..slot.value_range.end)?;
         previous = Some(key);
     }
-    validate_disjoint_ranges(&mut ranges)
+    Ok(())
 }
 
 fn validate_internal(page: &[u8; PAGE_SIZE], page_count: u64) -> Result<()> {
@@ -1425,7 +1899,7 @@ fn validate_internal(page: &[u8; PAGE_SIZE], page_count: u64) -> Result<()> {
     validate_page_id(format::get_u64(page, 8)?, page_count)?;
     let slots_end = PAGE_HEADER + count * SLOT_SIZE;
     let mut previous: Option<&[u8]> = None;
-    let mut ranges = Vec::with_capacity(count);
+    let mut occupied = [0_u64; PAGE_SIZE / u64::BITS as usize];
     for index in 0..count {
         let offset = PAGE_HEADER + index * SLOT_SIZE;
         let data_offset = usize::from(format::get_u16(page, offset)?);
@@ -1448,10 +1922,10 @@ fn validate_internal(page: &[u8; PAGE_SIZE], page_count: u64) -> Result<()> {
             ));
         }
         validate_page_id(format::get_u64(page, offset + 8)?, page_count)?;
-        ranges.push(data_offset..key_end);
+        mark_range(&mut occupied, data_offset..key_end)?;
         previous = Some(key);
     }
-    validate_disjoint_ranges(&mut ranges)
+    Ok(())
 }
 
 fn validate_overflow(page: &[u8; PAGE_SIZE], page_count: u64) -> Result<()> {
@@ -1506,10 +1980,17 @@ fn validate_page_id(page_id: u64, page_count: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_disjoint_ranges(ranges: &mut [Range<usize>]) -> Result<()> {
-    ranges.sort_unstable_by_key(|range| range.start);
-    if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
-        return Err(Error::Corrupt("page cells overlap".into()));
+fn mark_range(
+    occupied: &mut [u64; PAGE_SIZE / u64::BITS as usize],
+    range: Range<usize>,
+) -> Result<()> {
+    for offset in range {
+        let word = offset / u64::BITS as usize;
+        let bit = 1_u64 << (offset % u64::BITS as usize);
+        if occupied[word] & bit != 0 {
+            return Err(Error::Corrupt("page cells overlap".into()));
+        }
+        occupied[word] |= bit;
     }
     Ok(())
 }
