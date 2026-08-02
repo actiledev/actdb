@@ -26,6 +26,9 @@ assert_eq!(read.get(b"user:42")?.as_deref(), Some(b"Ada".as_slice()));
 - Zero-copy point reads for inline values
 - Values up to 4 GiB through overflow pages
 - Bounded SIEVE-style page cache
+- Persistent generation-safe page reclamation
+- Storage, snapshot, and cache statistics
+- No-clobber offline compaction
 - Portable positioned I/O and exclusive process locking
 - No async runtime, memory mapping, SQL parser, or background threads
 
