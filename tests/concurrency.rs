@@ -65,3 +65,16 @@ fn value_guard_should_outlive_read_transaction_and_database() -> Result<()> {
     assert_eq!(guard.as_ref(), b"value");
     Ok(())
 }
+
+#[test]
+fn unwinding_reader_should_unregister_its_generation() -> Result<()> {
+    let directory = tempdir()?;
+    let database = Database::open(directory.path().join("unwind-reader.actdb"))?;
+    let reader = database.read()?;
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _reader = reader;
+        panic!("intentional unwind");
+    }));
+    assert_eq!(database.stats()?.pinned_snapshots, 0);
+    Ok(())
+}
