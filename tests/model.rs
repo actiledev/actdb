@@ -43,3 +43,47 @@ fn mixed_transactions_should_match_reference_map_after_reopen() -> Result<()> {
     assert_eq!(actual, expected);
     Ok(())
 }
+
+#[test]
+fn variable_sized_multilevel_transactions_should_match_reference_map() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("variable-model.actdb");
+    let database = Database::open(&path)?;
+    let mut expected = BTreeMap::new();
+
+    let mut insertion = database.write()?;
+    for number in 0_u32..400 {
+        let mut key = number.to_be_bytes().to_vec();
+        key.resize(64 + number as usize % 449, number as u8);
+        let value = vec![number as u8; 32 + number as usize % 1_100];
+        insertion.put(&key, &value)?;
+        expected.insert(key, value);
+    }
+    insertion.commit()?;
+
+    let mut mutation = database.write()?;
+    for number in 0_u32..400 {
+        let mut key = number.to_be_bytes().to_vec();
+        key.resize(64 + number as usize % 449, number as u8);
+        if number % 2 == 0 {
+            assert!(mutation.delete(&key)?);
+            expected.remove(&key);
+        } else if number % 3 == 0 {
+            let value = vec![255 - number as u8; 8_500 + number as usize];
+            mutation.put(&key, &value)?;
+            expected.insert(key.clone(), value);
+            assert_eq!(mutation.get(&key)?, expected.get(&key).map(Vec::as_slice));
+        }
+    }
+    mutation.commit()?;
+    drop(database);
+
+    let database = Database::open(path)?;
+    let actual = database
+        .read()?
+        .scan(Bound::Unbounded, Bound::Unbounded)?
+        .map(|(key, value)| (key.into_vec(), value.into_vec()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(actual, expected);
+    Ok(())
+}

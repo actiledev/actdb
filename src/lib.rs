@@ -228,19 +228,19 @@ impl Database {
             .published
             .read()
             .map_err(|_| Error::Corrupt("metadata lock was poisoned".into()))?;
-        let entries = tree::collect(
-            &self.inner.file,
-            &self.inner.cache,
-            published.meta.root,
-            published.meta.page_count,
-            published.meta.item_count,
-        )?;
         Ok(WriteTxn {
             inner: &self.inner,
             _guard: guard,
             base: published,
-            entries,
-            closed: false,
+            tree: tree::MutableTree::new(
+                &self.inner.file,
+                &self.inner.cache,
+                published.meta.root,
+                published.meta.page_count,
+            ),
+            item_count: published.meta.item_count,
+            read_value: None,
+            poisoned: false,
         })
     }
 
@@ -344,19 +344,38 @@ pub struct WriteTxn<'db> {
     inner: &'db Inner,
     _guard: MutexGuard<'db, ()>,
     base: Published,
-    entries: BTreeMap<Vec<u8>, Vec<u8>>,
-    closed: bool,
+    tree: tree::MutableTree<'db>,
+    item_count: u64,
+    read_value: Option<Arc<[u8]>>,
+    poisoned: bool,
 }
 
 impl WriteTxn<'_> {
-    /// Returns a transaction-local copy of the value associated with `key`.
+    /// Returns a transaction-local view of the value associated with `key`.
+    ///
+    /// The mutable receiver lets the transaction retain a lazily loaded value.
+    /// The returned slice remains valid until the next mutable use of the
+    /// transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error if the key exceeds the format limit.
-    pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
-        validate_key(key)?;
-        Ok(self.entries.get(key).map(Vec::as_slice))
+    /// Returns an error if the transaction is poisoned, the key exceeds the
+    /// format limit, or a required page cannot be read or decoded. After an
+    /// error, subsequent methods return [`Error::TransactionClosed`].
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
+        self.ensure_open()?;
+        self.read_value = None;
+        let result = validate_key(key).and_then(|()| self.tree.get(key));
+        match result {
+            Ok(value) => {
+                self.read_value = value;
+                Ok(self.read_value.as_deref())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Inserts or replaces a key/value pair.
@@ -367,10 +386,26 @@ impl WriteTxn<'_> {
     /// its format limit.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_open()?;
-        validate_key(key)?;
-        validate_value(value)?;
-        self.entries.insert(key.to_vec(), value.to_vec());
-        Ok(())
+        self.read_value = None;
+        let result = validate_key(key)
+            .and_then(|()| validate_value(value))
+            .and_then(|()| self.tree.put(key, value));
+        match result {
+            Ok(outcome) => {
+                if outcome.inserted {
+                    let Some(item_count) = self.item_count.checked_add(1) else {
+                        self.poisoned = true;
+                        return Err(Error::Corrupt("transaction item count overflow".into()));
+                    };
+                    self.item_count = item_count;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Deletes a key and reports whether it previously existed.
@@ -380,8 +415,24 @@ impl WriteTxn<'_> {
     /// Returns an error if the transaction is closed or the key is oversized.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.ensure_open()?;
-        validate_key(key)?;
-        Ok(self.entries.remove(key).is_some())
+        self.read_value = None;
+        let result = validate_key(key).and_then(|()| self.tree.delete(key));
+        match result {
+            Ok(deleted) => {
+                if deleted {
+                    let Some(item_count) = self.item_count.checked_sub(1) else {
+                        self.poisoned = true;
+                        return Err(Error::Corrupt("transaction item count underflow".into()));
+                    };
+                    self.item_count = item_count;
+                }
+                Ok(deleted)
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Atomically publishes all changes in this transaction.
@@ -392,7 +443,7 @@ impl WriteTxn<'_> {
     /// written and published. The previously published generation remains valid.
     pub fn commit(mut self) -> Result<()> {
         self.ensure_open()?;
-        self.closed = true;
+        self.read_value = None;
         let physical_pages = self.inner.file.metadata()?.len() / PAGE_SIZE_U64;
         if physical_pages > self.base.meta.page_count {
             self.inner
@@ -402,7 +453,10 @@ impl WriteTxn<'_> {
                 .cache
                 .invalidate_from(self.base.meta.page_count)?;
         }
-        let built = tree::build(&self.inner.file, &self.entries, self.base.meta.page_count)?;
+        let finished = self.tree.finish(self.base.meta.page_count)?;
+        for (page_id, page) in &finished.pages {
+            io::write_page(&self.inner.file, *page_id, page)?;
+        }
         self.inner.file.sync_all()?;
 
         let meta = Meta {
@@ -412,9 +466,9 @@ impl WriteTxn<'_> {
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| Error::Corrupt("metadata generation overflow".into()))?,
-            root: built.root,
-            page_count: built.page_count,
-            item_count: self.entries.len() as u64,
+            root: finished.root,
+            page_count: finished.page_count,
+            item_count: self.item_count,
         };
         let slot = self.base.slot ^ 1;
         let page = format::encode_meta(meta);
@@ -432,7 +486,7 @@ impl WriteTxn<'_> {
     }
 
     fn ensure_open(&self) -> Result<()> {
-        if self.closed {
+        if self.poisoned {
             Err(Error::TransactionClosed)
         } else {
             Ok(())

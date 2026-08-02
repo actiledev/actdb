@@ -94,3 +94,32 @@ pub fn finish_page(page: &mut [u8; PAGE_SIZE]) {
     let checksum = crc32fast::hash(&page[..CHECKSUM_OFFSET]);
     put_u32(page, CHECKSUM_OFFSET, checksum);
 }
+
+pub fn latest_root(file: &File) -> io::Result<u64> {
+    let first = read_page(file, 0)?;
+    let second = read_page(file, 1)?;
+    let meta = if get_u64(&first, 16) >= get_u64(&second, 16) {
+        first
+    } else {
+        second
+    };
+    Ok(get_u64(&meta, 24))
+}
+
+pub fn leftmost_tree_page_count(file: &File, mut page_id: u64) -> io::Result<u64> {
+    let mut count = 0_u64;
+    loop {
+        count += 1;
+        let page = read_page(file, page_id)?;
+        match page[0] {
+            1 => return Ok(count),
+            2 => page_id = get_u64(&page, 8),
+            kind => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected tree page kind {kind}"),
+                ));
+            }
+        }
+    }
+}
