@@ -891,7 +891,7 @@ impl WriteTxn<'_> {
         let finished = self.tree.finish(&user_allocations, next_page)?;
         next_page = next_page.max(finished.page_count);
         let free_changed = !finished.pages.is_empty() || !finished.retired.is_empty();
-        let (built_free, free_allocations) = if free_changed {
+        let (built_free, current_free_pages) = if free_changed {
             for &page in &finished.retired {
                 free_mutation.insert(page, self.base.meta.generation)?;
             }
@@ -917,16 +917,15 @@ impl WriteTxn<'_> {
                 old_free_pages.iter().copied().collect(),
             )
         };
-        let reused = user_allocations
-            .iter()
-            .chain(&free_allocations)
-            .copied()
-            .filter(|page| *page < self.base.meta.page_count)
-            .collect::<HashSet<_>>();
-        self.inner.cache.invalidate_pages(&reused)?;
         let mut all_pages = finished.pages;
         all_pages.extend(built_free.pages);
         all_pages.sort_unstable_by_key(|(page, _)| *page);
+        let reused = all_pages
+            .iter()
+            .map(|(page, _)| *page)
+            .filter(|page| *page < self.base.meta.page_count)
+            .collect::<HashSet<_>>();
+        self.inner.cache.invalidate_pages(&reused)?;
         for (page_id, page) in &all_pages {
             io::write_page(&self.inner.file, *page_id, page)?;
         }
@@ -952,7 +951,7 @@ impl WriteTxn<'_> {
                 .and_then(|pages| pages.checked_add(user_allocations.len() as u64))
                 .ok_or_else(|| Error::Corrupt("user-tree page count overflow".into()))?,
             free_tree_pages: if free_changed {
-                free_allocations.len() as u64
+                current_free_pages.len() as u64
             } else {
                 self.base.meta.free_tree_pages
             },
@@ -973,7 +972,7 @@ impl WriteTxn<'_> {
         publication.current = current;
         publication.slots[slot as usize] = Some(meta);
         free_mutation.commit();
-        free_state.pages = free_allocations.into_iter().collect();
+        free_state.pages = current_free_pages.into_iter().collect();
         free_state.generation_counts = generation_counts(&free_state.entries);
         free_state.reusable_pages = reusable_count(
             &free_state.generation_counts,
@@ -1355,6 +1354,39 @@ mod fault_commit_tests {
             mutation.insert(9, 3)?;
         }
         assert_eq!(entries, original);
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_commit_should_keep_live_free_tree_frame_cached() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("unchanged-cache.actdb"))?;
+        let published = database
+            .inner
+            .published
+            .read()
+            .map_err(|_| Error::Corrupt("metadata lock was poisoned".into()))?
+            .current;
+        let cached = database.inner.cache.get(
+            &database.inner.file,
+            published.meta.free_root,
+            published.meta.page_count,
+        )?;
+
+        database.write()?.commit()?;
+
+        let current = database
+            .inner
+            .published
+            .read()
+            .map_err(|_| Error::Corrupt("metadata lock was poisoned".into()))?
+            .current;
+        let after = database.inner.cache.get(
+            &database.inner.file,
+            current.meta.free_root,
+            current.meta.page_count,
+        )?;
+        assert!(Arc::ptr_eq(&cached, &after));
         Ok(())
     }
 

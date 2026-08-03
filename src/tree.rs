@@ -1701,7 +1701,7 @@ fn read_overflow<I: PageIo + ?Sized>(
             "overflow length exceeds the snapshot capacity".into(),
         ));
     }
-    let mut value = Vec::with_capacity(expected_len);
+    let mut value = Vec::new();
     let mut remaining_pages = page_count;
     while page_id != 0 {
         if remaining_pages == 0 {
@@ -1728,12 +1728,16 @@ fn read_overflow<I: PageIo + ?Sized>(
             .bytes
             .get(OVERFLOW_HEADER..OVERFLOW_HEADER + len)
             .ok_or_else(|| Error::Corrupt("overflow chunk exceeds page".into()))?;
-        value.extend_from_slice(chunk);
-        if value.len() > expected_len {
+        let assembled_len = value
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| Error::Corrupt("overflow value length overflow".into()))?;
+        if assembled_len > expected_len {
             return Err(Error::Corrupt(
                 "overflow chain is longer than declared".into(),
             ));
         }
+        value.extend_from_slice(chunk);
         page_id = format::get_u64(&frame.bytes, 8)?;
     }
     if value.len() != expected_len {
@@ -2020,7 +2024,41 @@ impl<I: PageIo + ?Sized> PageWriter<'_, I> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
+
+    struct SinglePageIo {
+        page_id: u64,
+        page: [u8; PAGE_SIZE],
+    }
+
+    impl PageIo for SinglePageIo {
+        fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+            if offset != self.page_id * PAGE_SIZE as u64 {
+                return Ok(0);
+            }
+            let count = buffer.len().min(PAGE_SIZE);
+            buffer[..count].copy_from_slice(&self.page[..count]);
+            Ok(count)
+        }
+
+        fn write_at(&self, _buffer: &[u8], _offset: u64) -> io::Result<usize> {
+            unreachable!("overflow reader tests do not write")
+        }
+
+        fn len(&self) -> io::Result<u64> {
+            Ok((self.page_id + 1) * PAGE_SIZE as u64)
+        }
+
+        fn set_len(&self, _length: u64) -> io::Result<()> {
+            unreachable!("overflow reader tests do not resize")
+        }
+
+        fn sync_all(&self) -> io::Result<()> {
+            unreachable!("overflow reader tests do not sync")
+        }
+    }
 
     #[test]
     fn leaf_split_should_balance_actual_encoded_bytes() -> Result<()> {
@@ -2064,6 +2102,34 @@ mod tests {
         tree.put(b"first", b"one")?;
         tree.put(b"second", b"two")?;
         assert_eq!(tree.dirty_by_original.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn extreme_declared_overflow_length_should_validate_first_page() -> Result<()> {
+        let mut page = empty_page(LEAF);
+        format::finish_page(&mut page);
+        let storage = SinglePageIo { page_id: 2, page };
+        let cache = Cache::new(PAGE_SIZE * 2);
+        let page_count = 1_100_000;
+        assert!(matches!(
+            read_overflow(&storage, &cache, 2, page_count, u32::MAX as usize, None,),
+            Err(Error::Corrupt(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_chunk_should_be_rejected_before_exceeding_declared_length() -> Result<()> {
+        let mut page = empty_page(OVERFLOW);
+        format::put_u16(&mut page, 2, 2_000);
+        format::finish_page(&mut page);
+        let storage = SinglePageIo { page_id: 2, page };
+        let cache = Cache::new(PAGE_SIZE * 2);
+        assert!(matches!(
+            read_overflow(&storage, &cache, 2, 3, 1_025, None),
+            Err(Error::Corrupt(_))
+        ));
         Ok(())
     }
 }

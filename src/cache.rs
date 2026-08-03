@@ -22,8 +22,42 @@ impl Frame {
 }
 
 enum Entry {
-    Loading(u64),
+    Loading { token: u64, waiters: usize },
     Ready(Arc<Frame>),
+    Handoff { frame: Arc<Frame>, waiters: usize },
+}
+
+struct LoadGuard<'a> {
+    cache: &'a Cache,
+    page_id: u64,
+    token: u64,
+    armed: bool,
+}
+
+impl LoadGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LoadGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .cache
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            state.entries.get(&self.page_id),
+            Some(Entry::Loading { token, .. }) if *token == self.token
+        ) {
+            state.entries.remove(&self.page_id);
+        }
+        self.cache.changed.notify_all();
+    }
 }
 
 struct State {
@@ -82,6 +116,7 @@ impl Cache {
         }
 
         let mut classified = false;
+        let mut waiting = false;
         let load = loop {
             let mut state = self.lock()?;
             match state.entries.get(&page_id) {
@@ -92,12 +127,40 @@ impl Cache {
                     frame.visited.store(true, Ordering::Relaxed);
                     return Ok(Arc::clone(frame));
                 }
-                Some(Entry::Loading(_)) => {
+                Some(Entry::Loading { .. }) => {
                     if !classified {
                         self.misses.fetch_add(1, Ordering::Relaxed);
                         classified = true;
                     }
+                    if !waiting {
+                        let Some(Entry::Loading { waiters, .. }) = state.entries.get_mut(&page_id)
+                        else {
+                            unreachable!("the cache entry was just matched as loading");
+                        };
+                        *waiters += 1;
+                        waiting = true;
+                    }
                     drop(self.wait(state)?);
+                }
+                Some(Entry::Handoff { frame, .. }) => {
+                    let frame = Arc::clone(frame);
+                    if waiting {
+                        let remove = match state.entries.get_mut(&page_id) {
+                            Some(Entry::Handoff { waiters, .. }) => {
+                                *waiters -= 1;
+                                *waiters == 0
+                            }
+                            _ => unreachable!("the cache entry was just matched as a handoff"),
+                        };
+                        if remove {
+                            state.entries.remove(&page_id);
+                            self.changed.notify_all();
+                        }
+                    } else {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    frame.visited.store(true, Ordering::Relaxed);
+                    return Ok(frame);
                 }
                 None => {
                     if !classified {
@@ -105,10 +168,19 @@ impl Cache {
                     }
                     state.next_load = state.next_load.wrapping_add(1);
                     let token = state.next_load;
-                    state.entries.insert(page_id, Entry::Loading(token));
+                    state
+                        .entries
+                        .insert(page_id, Entry::Loading { token, waiters: 0 });
                     break token;
                 }
             }
+        };
+
+        let mut guard = LoadGuard {
+            cache: self,
+            page_id,
+            token: load,
+            armed: true,
         };
 
         let loaded = io::read_page(storage, page_id).and_then(|bytes| {
@@ -117,11 +189,15 @@ impl Cache {
         });
 
         let mut state = self.lock()?;
-        if !matches!(state.entries.get(&page_id), Some(Entry::Loading(token)) if *token == load) {
-            return Err(Error::Corrupt(
-                "cache load state changed unexpectedly".into(),
-            ));
-        }
+        let waiters = match state.entries.get(&page_id) {
+            Some(Entry::Loading { token, waiters }) if *token == load => *waiters,
+            _ => {
+                guard.disarm();
+                return Err(Error::Corrupt(
+                    "cache load state changed unexpectedly".into(),
+                ));
+            }
+        };
         match loaded {
             Ok(frame) => {
                 self.loads.fetch_add(1, Ordering::Relaxed);
@@ -133,14 +209,26 @@ impl Cache {
                     state.queue.push_back(page_id);
                     state.ready += 1;
                 } else {
-                    state.entries.remove(&page_id);
+                    if waiters == 0 {
+                        state.entries.remove(&page_id);
+                    } else {
+                        state.entries.insert(
+                            page_id,
+                            Entry::Handoff {
+                                frame: Arc::clone(&frame),
+                                waiters,
+                            },
+                        );
+                    }
                 }
                 self.changed.notify_all();
+                guard.disarm();
                 Ok(frame)
             }
             Err(error) => {
                 state.entries.remove(&page_id);
                 self.changed.notify_all();
+                guard.disarm();
                 Err(error)
             }
         }
@@ -148,11 +236,9 @@ impl Cache {
 
     pub fn invalidate_from(&self, first_page: u64) -> Result<()> {
         let mut state = self.lock()?;
-        while state
-            .entries
-            .iter()
-            .any(|(page, entry)| *page >= first_page && matches!(entry, Entry::Loading(_)))
-        {
+        while state.entries.iter().any(|(page, entry)| {
+            *page >= first_page && matches!(entry, Entry::Loading { .. } | Entry::Handoff { .. })
+        }) {
             state = self.wait(state)?;
         }
         state.entries.retain(|page, _| *page < first_page);
@@ -163,11 +249,9 @@ impl Cache {
 
     pub fn invalidate_pages(&self, pages: &HashSet<u64>) -> Result<()> {
         let mut state = self.lock()?;
-        while state
-            .entries
-            .iter()
-            .any(|(page, entry)| pages.contains(page) && matches!(entry, Entry::Loading(_)))
-        {
+        while state.entries.iter().any(|(page, entry)| {
+            pages.contains(page) && matches!(entry, Entry::Loading { .. } | Entry::Handoff { .. })
+        }) {
             state = self.wait(state)?;
         }
         state.entries.retain(|page, _| !pages.contains(page));
@@ -189,6 +273,15 @@ impl Cache {
             loads: self.loads.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(test)]
+    fn loading_waiters(&self, page_id: u64) -> Result<usize> {
+        let state = self.lock()?;
+        Ok(match state.entries.get(&page_id) {
+            Some(Entry::Loading { waiters, .. }) => *waiters,
+            _ => 0,
+        })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>> {
@@ -227,7 +320,8 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, mpsc};
+    use std::time::Duration;
 
     use crate::format::LEAF;
 
@@ -299,6 +393,69 @@ mod tests {
         }
     }
 
+    struct TargetIo {
+        inner: TestIo,
+        target: u64,
+        started: Option<Barrier>,
+        release: Option<Barrier>,
+        block_once: AtomicBool,
+        panic_once: AtomicBool,
+    }
+
+    impl TargetIo {
+        fn blocking(page_count: usize, target: u64) -> Self {
+            Self {
+                inner: TestIo::new(page_count),
+                target,
+                started: Some(Barrier::new(2)),
+                release: Some(Barrier::new(2)),
+                block_once: AtomicBool::new(true),
+                panic_once: AtomicBool::new(false),
+            }
+        }
+
+        fn panicking(page_count: usize, target: u64) -> Self {
+            Self {
+                inner: TestIo::new(page_count),
+                target,
+                started: None,
+                release: None,
+                block_once: AtomicBool::new(false),
+                panic_once: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl PageIo for TargetIo {
+        fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+            let page_id = offset / PAGE_SIZE as u64;
+            if page_id == self.target && self.panic_once.swap(false, Ordering::Relaxed) {
+                panic!("injected page load panic");
+            }
+            if page_id == self.target && self.block_once.swap(false, Ordering::Relaxed) {
+                self.started.as_ref().unwrap().wait();
+                self.release.as_ref().unwrap().wait();
+            }
+            self.inner.read_at(buffer, offset)
+        }
+
+        fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
+            self.inner.write_at(buffer, offset)
+        }
+
+        fn len(&self) -> io::Result<u64> {
+            self.inner.len()
+        }
+
+        fn set_len(&self, length: u64) -> io::Result<()> {
+            self.inner.set_len(length)
+        }
+
+        fn sync_all(&self) -> io::Result<()> {
+            self.inner.sync_all()
+        }
+    }
+
     #[test]
     fn concurrent_misses_should_load_one_copy_of_a_page() -> Result<()> {
         let cache = Cache::new(PAGE_SIZE * 2);
@@ -348,6 +505,62 @@ mod tests {
         assert_eq!(cache.get(&storage, 4, 5)?.bytes, unadmitted.bytes);
         assert_eq!(cache.occupancy()?.0, 2);
         drop((first, second, unadmitted));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_misses_should_share_an_unadmitted_frame() -> Result<()> {
+        let cache = Cache::new(PAGE_SIZE * 2);
+        let storage = TargetIo::blocking(5, 4);
+        let first_pinned = cache.get(&storage, 2, 5)?;
+        let second_pinned = cache.get(&storage, 3, 5)?;
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| cache.get(&storage, 4, 5));
+            storage.started.as_ref().unwrap().wait();
+            let second = scope.spawn(|| cache.get(&storage, 4, 5));
+            while cache.loading_waiters(4)? == 0 {
+                std::thread::yield_now();
+            }
+            storage.release.as_ref().unwrap().wait();
+            let first = first.join().unwrap()?;
+            let second = second.join().unwrap()?;
+            assert!(Arc::ptr_eq(&first, &second));
+            Result::Ok(())
+        })?;
+
+        assert_eq!(storage.inner.reads.load(Ordering::Relaxed), 3);
+        drop((first_pinned, second_pinned));
+        Ok(())
+    }
+
+    #[test]
+    fn panicking_load_should_not_strand_invalidation() -> Result<()> {
+        let cache = Arc::new(Cache::new(PAGE_SIZE * 2));
+        let storage = Arc::new(TargetIo::panicking(4, 2));
+        let loader_cache = Arc::clone(&cache);
+        let loader_storage = Arc::clone(&storage);
+        assert!(
+            std::thread::spawn(move || loader_cache.get(&*loader_storage, 2, 4))
+                .join()
+                .is_err()
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let invalidating_cache = Arc::clone(&cache);
+        let invalidator = std::thread::spawn(move || {
+            let result = invalidating_cache.invalidate_pages(&HashSet::from([2]));
+            sender.send(result).ok();
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| {
+                Error::Corrupt(format!("cache invalidation remained blocked: {error}"))
+            })??;
+        invalidator
+            .join()
+            .map_err(|_| Error::Corrupt("cache invalidation thread panicked".into()))?;
+        cache.get(&*storage, 2, 4)?;
         Ok(())
     }
 }
