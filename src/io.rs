@@ -1,52 +1,141 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::format::{PAGE_SIZE, PAGE_SIZE_U64};
 use crate::{Error, Result};
 
-pub(crate) trait PageIo {
+/// Positioned, synchronous storage used by the database engine.
+///
+/// Reads and writes may complete only part of the supplied buffer. actdb
+/// retries short transfers until the buffer is complete, or returns a
+/// structured I/O error if a backend stops making progress. Implementations
+/// must provide exclusive ownership for the lifetime of an open database.
+/// A successful [`Storage::sync_all`] must make all preceding writes and length
+/// changes durable according to the backend's documented lifecycle contract.
+pub trait Storage: Send + Sync + 'static {
+    /// Reads bytes beginning at `offset`, returning the transferred byte count.
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+    /// Writes bytes beginning at `offset`, returning the transferred byte count.
     fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize>;
+    /// Returns the current storage length in bytes.
     fn len(&self) -> io::Result<u64>;
+    /// Reports whether the storage currently contains no bytes.
+    fn is_empty(&self) -> io::Result<bool> {
+        self.len().map(|length| length == 0)
+    }
+    /// Changes the storage length to `length` bytes.
     fn set_len(&self, length: u64) -> io::Result<()>;
+    /// Makes preceding data and metadata changes durable.
     fn sync_all(&self) -> io::Result<()>;
 }
 
-impl PageIo for File {
+/// Native file-backed storage with an exclusive advisory lock.
+///
+/// The lock remains held until this value is dropped. Custom storage backends
+/// are responsible for providing equivalent exclusive ownership themselves.
+#[derive(Debug)]
+pub struct FileStorage {
+    file: File,
+    path: PathBuf,
+    created: bool,
+}
+
+impl FileStorage {
+    pub(crate) fn open(path: &Path, create: bool) -> crate::Result<Self> {
+        let existed = path.exists();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(create);
+        let file = options.open(path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(crate::Error::Locked),
+            Err(std::fs::TryLockError::Error(error)) => return Err(crate::Error::Io(error)),
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            created: !existed,
+        })
+    }
+
+    pub(crate) fn sync_parent_if_created(&self) -> crate::Result<()> {
+        if self.created {
+            sync_parent(&self.path)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn sync_parent(path: &Path) -> crate::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+impl Storage for FileStorage {
+    #[cfg(unix)]
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.file, buffer, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_read(&self.file, buffer, offset)
+    }
+
+    #[cfg(unix)]
+    fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::write_at(&self.file, buffer, offset)
+    }
+
+    #[cfg(windows)]
+    fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_write(&self.file, buffer, offset)
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        self.file.metadata().map(|metadata| metadata.len())
+    }
+
+    fn set_len(&self, length: u64) -> io::Result<()> {
+        self.file.set_len(length)
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+impl Storage for File {
     #[cfg(unix)]
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
         std::os::unix::fs::FileExt::read_at(self, buffer, offset)
     }
-
     #[cfg(windows)]
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
         std::os::windows::fs::FileExt::seek_read(self, buffer, offset)
     }
-
     #[cfg(unix)]
     fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
         std::os::unix::fs::FileExt::write_at(self, buffer, offset)
     }
-
     #[cfg(windows)]
     fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
         std::os::windows::fs::FileExt::seek_write(self, buffer, offset)
     }
-
     fn len(&self) -> io::Result<u64> {
         self.metadata().map(|metadata| metadata.len())
     }
-
     fn set_len(&self, length: u64) -> io::Result<()> {
         File::set_len(self, length)
     }
-
     fn sync_all(&self) -> io::Result<()> {
         File::sync_all(self)
     }
 }
 
-pub(crate) fn read_page<I: PageIo + ?Sized>(io: &I, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
+pub(crate) fn read_page<I: Storage + ?Sized>(io: &I, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
     let mut page = [0_u8; PAGE_SIZE];
     read_exact_at(
         io,
@@ -58,7 +147,7 @@ pub(crate) fn read_page<I: PageIo + ?Sized>(io: &I, page_id: u64) -> Result<[u8;
     Ok(page)
 }
 
-pub(crate) fn write_page<I: PageIo + ?Sized>(
+pub(crate) fn write_page<I: Storage + ?Sized>(
     io: &I,
     page_id: u64,
     page: &[u8; PAGE_SIZE],
@@ -72,19 +161,19 @@ pub(crate) fn write_page<I: PageIo + ?Sized>(
     )
 }
 
-pub(crate) fn len<I: PageIo + ?Sized>(io: &I) -> Result<u64> {
+pub(crate) fn len<I: Storage + ?Sized>(io: &I) -> Result<u64> {
     io.len().map_err(Error::from)
 }
 
-pub(crate) fn set_len<I: PageIo + ?Sized>(io: &I, length: u64) -> Result<()> {
+pub(crate) fn set_len<I: Storage + ?Sized>(io: &I, length: u64) -> Result<()> {
     io.set_len(length).map_err(Error::from)
 }
 
-pub(crate) fn sync_all<I: PageIo + ?Sized>(io: &I) -> Result<()> {
+pub(crate) fn sync_all<I: Storage + ?Sized>(io: &I) -> Result<()> {
     io.sync_all().map_err(Error::from)
 }
 
-fn read_exact_at<I: PageIo + ?Sized>(io: &I, mut buffer: &mut [u8], mut offset: u64) -> Result<()> {
+fn read_exact_at<I: Storage + ?Sized>(io: &I, mut buffer: &mut [u8], mut offset: u64) -> Result<()> {
     while !buffer.is_empty() {
         let read = io.read_at(buffer, offset)?;
         if read == 0 {
@@ -98,7 +187,7 @@ fn read_exact_at<I: PageIo + ?Sized>(io: &I, mut buffer: &mut [u8], mut offset: 
     Ok(())
 }
 
-fn write_all_at<I: PageIo + ?Sized>(io: &I, mut buffer: &[u8], mut offset: u64) -> Result<()> {
+fn write_all_at<I: Storage + ?Sized>(io: &I, mut buffer: &[u8], mut offset: u64) -> Result<()> {
     while !buffer.is_empty() {
         let written = io.write_at(buffer, offset)?;
         if written == 0 {
@@ -204,7 +293,7 @@ pub(crate) mod fault {
         }
     }
 
-    impl PageIo for FaultDisk {
+    impl Storage for FaultDisk {
         fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
             let mut state = self.state.lock().unwrap();
             Self::operation(&mut state)?;

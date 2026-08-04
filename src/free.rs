@@ -4,7 +4,7 @@ use crate::cache::Cache;
 use crate::format::{
     self, FREE_INTERNAL, FREE_LEAF, PAGE_CHECKSUM_OFFSET, PAGE_HEADER, PAGE_SIZE, SLOT_SIZE,
 };
-use crate::io::PageIo;
+use crate::Storage;
 use crate::{Error, Result};
 
 const LEAF_CAPACITY: usize = (PAGE_CHECKSUM_OFFSET - PAGE_HEADER) / SLOT_SIZE;
@@ -51,7 +51,7 @@ impl Layout {
     }
 }
 
-pub(crate) fn load<I: PageIo + ?Sized>(
+pub(crate) fn load<I: Storage + ?Sized>(
     file: &I,
     cache: &Cache,
     root: u64,
@@ -65,7 +65,7 @@ pub(crate) fn load<I: PageIo + ?Sized>(
     Ok(loaded)
 }
 
-fn load_page<I: PageIo + ?Sized>(
+fn load_page<I: Storage + ?Sized>(
     file: &I,
     cache: &Cache,
     page_id: u64,

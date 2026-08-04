@@ -8,7 +8,7 @@ use crate::format::{
     self, INTERNAL, LEAF, OVERFLOW, PAGE_CHECKSUM_OFFSET, PAGE_HEADER, PAGE_SIZE, SLOT_SIZE,
 };
 use crate::io;
-use crate::io::PageIo;
+use crate::Storage;
 use crate::{Error, Result};
 
 const PAGE_END: usize = PAGE_CHECKSUM_OFFSET;

@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::format::{self, PAGE_SIZE};
 use crate::io;
-use crate::io::PageIo;
+use crate::Storage;
 use crate::{Error, Result};
 
 pub(crate) struct Frame {
@@ -103,7 +103,7 @@ impl Cache {
         }
     }
 
-    pub fn get<I: PageIo + ?Sized>(
+    pub fn get<I: Storage + ?Sized>(
         &self,
         storage: &I,
         page_id: u64,
